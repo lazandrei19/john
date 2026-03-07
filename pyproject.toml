@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "romanian-whist-rl"
+version = "0.1.0"
+description = "Deep reinforcement learning agent and tooling for Romanian whist."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Codex" }
+]
+dependencies = [
+  "fastapi>=0.115",
+  "httpx>=0.28",
+  "jinja2>=3.1",
+  "numpy>=1.26",
+  "tensorboard>=2.19",
+  "torch>=2.5",
+  "typer>=0.15",
+  "uvicorn>=0.34",
+]
+
+[project.optional-dependencies]
+mlx = [
+  "mlx>=0.24",
+]
+dev = [
+  "pytest>=8.3",
+]
+
+[project.scripts]
+romanian-whist = "romanian_whist.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/romanian_whist"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

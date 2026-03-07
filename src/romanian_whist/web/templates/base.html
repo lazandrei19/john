@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Romanian Whist UI</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body data-mode="{{ mode }}">
+  <header class="app-header">
+    <div>
+      <p class="eyebrow">Romanian Whist RL</p>
+      <h1>Local Game UI</h1>
+    </div>
+    <nav class="nav-links">
+      <a href="/play">Play</a>
+      <a href="/inspect">Inspect</a>
+      <a href="/advisor">Advisor</a>
+    </nav>
+  </header>
+  <main class="layout">
+    {% block content %}{% endblock %}
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

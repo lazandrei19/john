@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel control-panel">
+  <h2>Play Setup</h2>
+  <label>Players <input id="players" type="number" min="3" max="6" value="{{ default_players }}"></label>
+  <label>Seed <input id="seed" type="number" value="0"></label>
+  <label>Checkpoint <input id="checkpoint" type="text" value="{{ default_checkpoint }}"></label>
+  <label>Device <input id="device" type="text" value="{{ default_device }}"></label>
+  <label>Seat Roles <input id="seat-config" type="text" value="{{ default_roles }}"></label>
+  <div class="button-row">
+    <button id="create-play">Create Game</button>
+    <button id="autoplay-play">Autoplay To Human</button>
+    <button id="step-play">Step One Bot</button>
+    <button id="recommend-play">Recommend Current</button>
+  </div>
+  <label class="checkbox"><input id="reveal-play" type="checkbox"> Reveal all cards</label>
+  <p class="hint">Use roles like <code>human,model,heuristic,random</code>.</p>
+</section>
+
+<section class="panel game-panel">
+  <div class="session-meta">
+    <span id="play-status">No session yet.</span>
+  </div>
+  <div id="play-board" class="board"></div>
+  <div id="play-actions" class="action-grid"></div>
+  <div class="split-grid">
+    <div>
+      <h3>Model Output</h3>
+      <pre id="play-recommendation" class="code-block">None</pre>
+    </div>
+    <div>
+      <h3>Event Log</h3>
+      <div id="play-events" class="log"></div>
+    </div>
+  </div>
+</section>
+{% endblock %}

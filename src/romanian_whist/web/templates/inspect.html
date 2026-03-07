@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel control-panel">
+  <h2>Inspect Setup</h2>
+  <label>Players <input id="players" type="number" min="3" max="6" value="{{ default_players }}"></label>
+  <label>Seed <input id="seed" type="number" value="0"></label>
+  <label>Checkpoint <input id="checkpoint" type="text" value="{{ default_checkpoint }}"></label>
+  <label>Device <input id="device" type="text" value="{{ default_device }}"></label>
+  <label>Seat Roles <input id="seat-config" type="text" value="{{ default_roles }}"></label>
+  <div class="button-row">
+    <button id="create-inspect">Create Session</button>
+    <button id="autoplay-inspect">Autoplay</button>
+    <button id="step-inspect">Step One</button>
+    <button id="export-inspect">Export Replay JSON</button>
+  </div>
+  <label class="checkbox"><input id="reveal-inspect" type="checkbox" checked> Reveal all cards</label>
+  <label>Replay Step <input id="replay-step" type="number" min="0" value="0"></label>
+  <button id="jump-inspect">Jump</button>
+  <label>Replay JSON <textarea id="replay-json" rows="8" placeholder="Paste exported replay JSON here"></textarea></label>
+  <button id="load-replay">Load Replay</button>
+</section>
+
+<section class="panel game-panel">
+  <div class="session-meta">
+    <span id="inspect-status">No session yet.</span>
+  </div>
+  <div id="inspect-board" class="board"></div>
+  <div class="split-grid">
+    <div>
+      <h3>Acting Seat Recommendation</h3>
+      <pre id="inspect-recommendation" class="code-block">None</pre>
+      <h3>Observation Snapshot</h3>
+      <pre id="inspect-observation" class="code-block">None</pre>
+    </div>
+    <div>
+      <h3>Event Log</h3>
+      <div id="inspect-events" class="log"></div>
+    </div>
+  </div>
+</section>
+{% endblock %}

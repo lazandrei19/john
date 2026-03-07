@@ -1,0 +1,251 @@
+:root {
+  --bg: #f4efe5;
+  --panel: rgba(255, 250, 242, 0.92);
+  --ink: #1f1a16;
+  --muted: #6b5f57;
+  --accent: #1a6b5b;
+  --accent-2: #b36a1f;
+  --line: rgba(31, 26, 22, 0.12);
+  --table: radial-gradient(circle at top, rgba(255,255,255,0.25), rgba(0,0,0,0.15)), linear-gradient(135deg, #1f6a54, #0f4a40);
+  --card: linear-gradient(180deg, #fffdf8, #efe7dc);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Iowan Old Style", "Palatino Linotype", serif;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at top left, rgba(179, 106, 31, 0.12), transparent 34%),
+    radial-gradient(circle at top right, rgba(26, 107, 91, 0.16), transparent 28%),
+    var(--bg);
+}
+
+.app-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  padding: 2rem 2rem 1rem;
+}
+
+.eyebrow {
+  margin: 0;
+  font-size: 0.75rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+h1, h2, h3 {
+  margin: 0 0 0.75rem;
+}
+
+.nav-links {
+  display: flex;
+  gap: 1rem;
+}
+
+.nav-links a {
+  color: var(--ink);
+  text-decoration: none;
+  padding-bottom: 0.15rem;
+  border-bottom: 2px solid transparent;
+}
+
+.nav-links a:hover {
+  border-color: var(--accent);
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(300px, 360px) 1fr;
+  gap: 1.25rem;
+  padding: 0 2rem 2rem;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  padding: 1.25rem;
+  box-shadow: 0 20px 40px rgba(47, 34, 24, 0.08);
+}
+
+.control-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.game-panel {
+  min-height: 75vh;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.95rem;
+}
+
+input,
+textarea,
+button {
+  font: inherit;
+}
+
+input,
+textarea {
+  width: 100%;
+  padding: 0.7rem 0.85rem;
+  border-radius: 14px;
+  border: 1px solid rgba(31, 26, 22, 0.15);
+  background: rgba(255, 255, 255, 0.72);
+}
+
+button {
+  border: 0;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--accent), #0f4a40);
+  color: white;
+  padding: 0.7rem 1rem;
+  cursor: pointer;
+}
+
+button:hover {
+  filter: brightness(1.05);
+}
+
+.button-row,
+.mini-grid {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.checkbox {
+  flex-direction: row;
+  align-items: center;
+}
+
+.board {
+  background: var(--table);
+  color: white;
+  border-radius: 30px;
+  min-height: 320px;
+  padding: 1rem;
+  display: grid;
+  gap: 1rem;
+}
+
+.board-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  justify-content: space-between;
+}
+
+.seat-grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.seat {
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 18px;
+  padding: 0.8rem;
+}
+
+.seat.current {
+  outline: 2px solid rgba(255, 226, 158, 0.85);
+}
+
+.cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-top: 0.6rem;
+}
+
+.card-pill {
+  background: var(--card);
+  color: var(--ink);
+  padding: 0.45rem 0.7rem;
+  border-radius: 12px;
+  font-size: 0.88rem;
+  min-width: 3.4rem;
+  text-align: center;
+}
+
+.card-pill.hidden {
+  background: rgba(255,255,255,0.16);
+  color: white;
+}
+
+.action-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin: 1rem 0;
+}
+
+.split-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.log {
+  max-height: 24rem;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255,255,255,0.6);
+  padding: 0.8rem;
+}
+
+.log-entry {
+  padding: 0.5rem 0;
+  border-bottom: 1px solid rgba(31, 26, 22, 0.08);
+}
+
+.code-block {
+  white-space: pre-wrap;
+  background: rgba(26, 107, 91, 0.08);
+  border-radius: 18px;
+  padding: 0.8rem;
+  min-height: 8rem;
+  overflow: auto;
+}
+
+.session-meta {
+  margin-bottom: 1rem;
+  color: var(--muted);
+}
+
+.hint {
+  margin: 0;
+  color: var(--muted);
+}
+
+@media (max-width: 1000px) {
+  .layout {
+    grid-template-columns: 1fr;
+    padding: 0 1rem 1rem;
+  }
+
+  .app-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 1rem;
+  }
+
+  .split-grid {
+    grid-template-columns: 1fr;
+  }
+}

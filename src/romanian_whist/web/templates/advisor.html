@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel control-panel">
+  <h2>Real-World Advisor</h2>
+  <label>Players <input id="advisor-players" type="number" min="3" max="6" value="{{ default_players }}"></label>
+  <label>Advised Seat <input id="advisor-seat" type="number" min="0" value="0"></label>
+  <label>Dealer <input id="advisor-dealer" type="number" min="0" value="0"></label>
+  <label>Hand Size <input id="advisor-hand-size" type="number" min="1" max="8" value="8"></label>
+  <label>Round Index <input id="advisor-round-index" type="number" min="0" value="0"></label>
+  <label>Your Hand <input id="advisor-hand" type="text" placeholder="AS,10H,2C"></label>
+  <label>Trump Card <input id="advisor-trump" type="text" placeholder="QD"></label>
+  <label>Checkpoint <input id="advisor-checkpoint" type="text" value="{{ default_checkpoint }}"></label>
+  <label>Device <input id="advisor-device" type="text" value="{{ default_device }}"></label>
+  <div class="button-row">
+    <button id="create-advisor">Start Advisor Session</button>
+    <button id="advisor-recommend">Recommend Now</button>
+  </div>
+  <h3>Guided Input</h3>
+  <div class="mini-grid">
+    <label>Bid Player <input id="advisor-bid-player" type="number" min="0" value="0"></label>
+    <label>Bid <input id="advisor-bid-value" type="number" min="0" value="0"></label>
+    <button id="advisor-submit-bid">Record Bid</button>
+  </div>
+  <div class="mini-grid">
+    <label>Card Player <input id="advisor-card-player" type="number" min="0" value="0"></label>
+    <label>Card <input id="advisor-card-value" type="text" placeholder="AS"></label>
+    <button id="advisor-submit-card">Record Card</button>
+  </div>
+  <h3>Manual Correction</h3>
+  <label>Hand CSV <input id="manual-hand" type="text"></label>
+  <label>Bids CSV <input id="manual-bids" type="text" placeholder="1,,0,2"></label>
+  <label>Tricks CSV <input id="manual-tricks" type="text" placeholder="0,1,0,0"></label>
+  <label>Scores CSV <input id="manual-scores" type="text" placeholder="5,0,-1,3"></label>
+  <label>Current Trick <input id="manual-trick" type="text" placeholder="0:AS,1:10H"></label>
+  <label>Current Player <input id="manual-player" type="number" min="0"></label>
+  <label>Phase <input id="manual-phase" type="text" placeholder="bidding or play"></label>
+  <label>Leader <input id="manual-leader" type="number" min="0"></label>
+  <label>Trump Card <input id="manual-trump" type="text"></label>
+  <button id="advisor-manual">Apply Manual Update</button>
+</section>
+
+<section class="panel game-panel">
+  <div class="session-meta">
+    <span id="advisor-status">No advisor session yet.</span>
+  </div>
+  <div class="split-grid">
+    <div>
+      <h3>Current State</h3>
+      <pre id="advisor-state" class="code-block">None</pre>
+    </div>
+    <div>
+      <h3>Recommendation</h3>
+      <pre id="advisor-recommendation" class="code-block">None</pre>
+      <h3>Event Log</h3>
+      <div id="advisor-events" class="log"></div>
+    </div>
+  </div>
+</section>
+{% endblock %}
