@@ -39,6 +39,66 @@ def test_ppo_smoke_and_checkpoint_roundtrip(tmp_path: pathlib.Path) -> None:
     assert policy is not None
 
 
+def test_resume_training_continues_checkpoint_numbering(tmp_path: pathlib.Path) -> None:
+    trainer = LeagueTrainer(
+        variant_config=WhistVariantConfig(players=4, seed=17),
+        ppo_config=PPOConfig(epochs=1, batch_size=8),
+        league_config=LeagueConfig(
+            total_updates=1,
+            episodes_per_update=1,
+            checkpoint_dir=tmp_path,
+            seed=17,
+            evaluation_matches=1,
+            evaluation_player_counts=(3, 4),
+        ),
+    )
+    trainer.train(updates=1)
+    policy, payload = load_policy_checkpoint(tmp_path / "update-0001.pt")
+
+    resumed = LeagueTrainer(
+        variant_config=WhistVariantConfig(players=4, seed=17),
+        ppo_config=PPOConfig(epochs=1, batch_size=8),
+        league_config=LeagueConfig(
+            total_updates=1,
+            episodes_per_update=1,
+            checkpoint_dir=tmp_path,
+            seed=17,
+            evaluation_matches=1,
+            evaluation_player_counts=(3, 4),
+        ),
+    )
+    resumed.policy.load_state_dict(policy.state_dict())
+    resumed.ppo.optimizer.load_state_dict(payload["optimizer_state"])
+    resumed.best_selection_score = resumed.selection_score(payload["metadata"]["evaluation"])
+    resumed.train(updates=1, start_update=int(payload["metadata"]["update"]))
+
+    checkpoint = tmp_path / "update-0002.pt"
+    assert checkpoint.exists()
+    _, resumed_payload = load_policy_checkpoint(checkpoint)
+    assert resumed_payload["metadata"]["update"] == 2
+
+
+def test_sparse_evaluation_only_writes_reports_on_interval(tmp_path: pathlib.Path) -> None:
+    trainer = LeagueTrainer(
+        variant_config=WhistVariantConfig(players=4, seed=9),
+        ppo_config=PPOConfig(epochs=1, batch_size=8),
+        league_config=LeagueConfig(
+            total_updates=2,
+            episodes_per_update=1,
+            checkpoint_dir=tmp_path,
+            seed=9,
+            evaluation_matches=1,
+            evaluation_interval=2,
+            evaluation_player_counts=(3, 4),
+        ),
+    )
+    history = trainer.train(updates=2)
+    assert "selection_score" not in history[0]
+    assert "selection_score" in history[1]
+    assert not (tmp_path / "update-0001.eval.json").exists()
+    assert (tmp_path / "update-0002.eval.json").exists()
+
+
 def test_checkpoint_converter_exports_npz(tmp_path: pathlib.Path) -> None:
     trainer = LeagueTrainer(
         variant_config=WhistVariantConfig(players=4, seed=4),

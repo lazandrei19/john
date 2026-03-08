@@ -99,7 +99,9 @@ def train(
     one_card_modes: str = typer.Option("regular,forehead,blind", "--one-card-modes"),
     universal: bool = typer.Option(True, "--universal/--fixed-player-count"),
     evaluation_matches: int = typer.Option(4, "--evaluation-matches"),
+    evaluation_every: int = typer.Option(1, "--evaluation-every"),
     tensorboard_logdir: Optional[Path] = typer.Option(None, "--tensorboard-logdir"),
+    resume_from: Optional[Path] = typer.Option(None, "--resume-from"),
 ) -> None:
     output.mkdir(parents=True, exist_ok=True)
     evaluation_player_counts = (3, 4, 5, 6) if universal else (players,)
@@ -114,11 +116,29 @@ def train(
             device=device,
             seed=seed,
             evaluation_matches=evaluation_matches,
+            evaluation_interval=evaluation_every,
             evaluation_player_counts=evaluation_player_counts,
             tensorboard_log_dir=resolved_tensorboard_logdir,
         ),
     )
-    history = trainer.train(updates=updates)
+    start_update = 0
+    if resume_from is not None:
+        policy, payload = load_policy_checkpoint(resume_from, device=device)
+        trainer.policy.load_state_dict(policy.state_dict())
+        optimizer_state = payload.get("optimizer_state")
+        if optimizer_state is not None:
+            trainer.ppo.optimizer.load_state_dict(optimizer_state)
+        metadata = payload.get("metadata", {})
+        start_update = int(metadata.get("update", 0))
+        best_eval_path = output / "best.eval.json"
+        if best_eval_path.exists():
+            trainer.best_selection_score = trainer.selection_score(json.loads(best_eval_path.read_text()))
+        elif "evaluation" in metadata:
+            trainer.best_selection_score = trainer.selection_score(metadata["evaluation"])
+        typer.echo(
+            "Resuming from {path} at update {update}.".format(path=resume_from, update=start_update)
+        )
+    history = trainer.train(updates=updates, start_update=start_update)
     typer.echo(json.dumps(history[-1], indent=2))
     typer.echo(json.dumps(trainer.evaluate(matches=evaluation_matches), indent=2))
 

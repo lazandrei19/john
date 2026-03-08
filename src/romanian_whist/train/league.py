@@ -33,6 +33,7 @@ class LeagueConfig:
     seed: int = 0
     balanced_player_count_sampling: bool = True
     evaluation_matches: int = 4
+    evaluation_interval: int = 1
     evaluation_player_counts: tuple[int, ...] = (3, 4, 5, 6)
     save_best_checkpoint: bool = True
     tensorboard_log_dir: Optional[Path] = None
@@ -62,24 +63,31 @@ class LeagueTrainer:
             BidPlayHeuristicAgent(seed=self.league_config.seed + 2),
         ]
 
-    def train(self, updates: Optional[int] = None) -> List[Dict[str, float]]:
+    def train(self, updates: Optional[int] = None, start_update: int = 0) -> List[Dict[str, float]]:
         total_updates = updates or self.league_config.total_updates
         history = []
         try:
-            for update_index in range(total_updates):
-                stage = self.curriculum.stage_for_update(update_index)
+            for local_update_index in range(total_updates):
+                update_index = start_update + local_update_index + 1
+                stage = self.curriculum.stage_for_update(update_index - 1)
                 buffer = self.collect_rollouts(stage.player_counts, stage.one_card_modes, self.league_config.episodes_per_update)
                 metrics = self.ppo.update(buffer)
                 metrics["stage"] = stage.name
                 metrics["transitions"] = float(len(buffer))
-                evaluation = self.evaluate(matches=self.league_config.evaluation_matches)
-                metrics["selection_score"] = self.selection_score(evaluation)
+                evaluation = None
+                should_evaluate = (
+                    update_index % self.league_config.evaluation_interval == 0
+                    or update_index == start_update + total_updates
+                )
+                if should_evaluate:
+                    evaluation = self.evaluate(matches=self.league_config.evaluation_matches)
+                    metrics["selection_score"] = self.selection_score(evaluation)
                 history.append(metrics)
-                self._log_update(update_index + 1, metrics, evaluation)
-                if (update_index + 1) % self.league_config.snapshot_interval == 0:
+                self._log_update(update_index, metrics, evaluation)
+                if update_index % self.league_config.snapshot_interval == 0:
                     self._promote_snapshot()
-                self._save_checkpoint(update_index + 1, metrics, evaluation)
-                self._save_best_checkpoint(update_index + 1, metrics, evaluation)
+                self._save_checkpoint(update_index, metrics, evaluation)
+                self._save_best_checkpoint(update_index, metrics, evaluation)
         finally:
             if self.writer is not None:
                 self.writer.flush()
@@ -213,7 +221,7 @@ class LeagueTrainer:
         if len(self.snapshots) > self.league_config.max_snapshots:
             self.snapshots = self.snapshots[-self.league_config.max_snapshots :]
 
-    def _save_checkpoint(self, update_index: int, metrics: Dict[str, float], evaluation: Dict[str, object]) -> None:
+    def _save_checkpoint(self, update_index: int, metrics: Dict[str, float], evaluation: Optional[Dict[str, object]]) -> None:
         if self.league_config.checkpoint_dir is None:
             return
         path = self.league_config.checkpoint_dir / "update-{index:04d}.pt".format(index=update_index)
@@ -223,11 +231,12 @@ class LeagueTrainer:
             optimizer=self.ppo.optimizer,
             metadata={"metrics": metrics, "evaluation": evaluation, "update": update_index},
         )
-        report_path = self.league_config.checkpoint_dir / "update-{index:04d}.eval.json".format(index=update_index)
-        report_path.write_text(json.dumps(evaluation, indent=2))
+        if evaluation is not None:
+            report_path = self.league_config.checkpoint_dir / "update-{index:04d}.eval.json".format(index=update_index)
+            report_path.write_text(json.dumps(evaluation, indent=2))
 
-    def _save_best_checkpoint(self, update_index: int, metrics: Dict[str, float], evaluation: Dict[str, object]) -> None:
-        if self.league_config.checkpoint_dir is None or not self.league_config.save_best_checkpoint:
+    def _save_best_checkpoint(self, update_index: int, metrics: Dict[str, float], evaluation: Optional[Dict[str, object]]) -> None:
+        if self.league_config.checkpoint_dir is None or not self.league_config.save_best_checkpoint or evaluation is None:
             return
         selection_score = self.selection_score(evaluation)
         if selection_score <= self.best_selection_score:
@@ -243,7 +252,7 @@ class LeagueTrainer:
         report_path = self.league_config.checkpoint_dir / "best.eval.json"
         report_path.write_text(json.dumps(evaluation, indent=2))
 
-    def _log_update(self, update_index: int, metrics: Dict[str, float], evaluation: Dict[str, object]) -> None:
+    def _log_update(self, update_index: int, metrics: Dict[str, float], evaluation: Optional[Dict[str, object]]) -> None:
         if self.writer is None:
             return
         stage_map = {"stage_1": 1.0, "stage_2": 2.0, "stage_3": 3.0}
@@ -253,8 +262,9 @@ class LeagueTrainer:
                 self.writer.add_text("train/stage_name", str(value), global_step=update_index)
                 continue
             self.writer.add_scalar("train/{key}".format(key=key), float(value), update_index)
-        for tag, value in self._flatten_scalars(evaluation):
-            self.writer.add_scalar(tag, value, update_index)
+        if evaluation is not None:
+            for tag, value in self._flatten_scalars(evaluation):
+                self.writer.add_scalar(tag, value, update_index)
         self.writer.flush()
 
     def _flatten_scalars(self, value: object, prefix: str = "eval") -> List[tuple[str, float]]:

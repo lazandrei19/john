@@ -32,6 +32,28 @@ TensorBoard logs are written to `runs/universal/tensorboard` by default. Start T
 uv run tensorboard --logdir runs
 ```
 
+Resume a previous run from its latest checkpoint:
+
+```bash
+RESUME_FROM=runs/universal/update-0500.pt \
+DEVICE=cuda \
+UPDATES=500 \
+OUTPUT=runs/universal \
+./scripts/train_universal_model.sh
+```
+
+For long CUDA runs, reduce evaluation overhead by evaluating every few updates instead of every update:
+
+```bash
+DEVICE=cuda \
+UPDATES=500 \
+EPISODES_PER_UPDATE=64 \
+EVALUATION_MATCHES=16 \
+EVALUATION_EVERY=10 \
+OUTPUT=runs/universal-fast \
+./scripts/train_universal_model.sh
+```
+
 ## Evaluate and play a trained model
 
 Evaluate the best universal checkpoint across all supported player counts:
