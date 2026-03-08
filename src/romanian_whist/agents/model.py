@@ -19,11 +19,16 @@ def tensorize_observation(observation: Mapping[str, object], device: Optional[to
 
 
 def batch_observations(observations: list[Mapping[str, object]], device: Optional[torch.device] = None) -> Dict[str, Tensor]:
-    keys = observations[0].keys()
-    return {
-        key: torch.stack([tensorize_observation(obs, device=device)[key] for obs in observations], dim=0)
-        for key in keys
-    }
+    tensorized = [tensorize_observation(obs) for obs in observations]
+    keys = tensorized[0].keys()
+    batches = {}  # type: Dict[str, Tensor]
+    for key in keys:
+        stacked = torch.stack([obs[key] for obs in tensorized], dim=0)
+        if device is not None:
+            batches[key] = stacked.to(device=device)
+        else:
+            batches[key] = stacked
+    return batches
 
 
 def masked_logits(logits: Tensor, legal_action_mask: Tensor) -> Tensor:
