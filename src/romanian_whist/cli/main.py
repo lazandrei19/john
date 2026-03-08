@@ -100,6 +100,8 @@ def train(
     universal: bool = typer.Option(True, "--universal/--fixed-player-count"),
     evaluation_matches: int = typer.Option(4, "--evaluation-matches"),
     evaluation_every: int = typer.Option(1, "--evaluation-every"),
+    rollout_workers: int = typer.Option(1, "--rollout-workers"),
+    eval_workers: int = typer.Option(1, "--eval-workers"),
     tensorboard_logdir: Optional[Path] = typer.Option(None, "--tensorboard-logdir"),
     resume_from: Optional[Path] = typer.Option(None, "--resume-from"),
 ) -> None:
@@ -118,6 +120,8 @@ def train(
             evaluation_matches=evaluation_matches,
             evaluation_interval=evaluation_every,
             evaluation_player_counts=evaluation_player_counts,
+            rollout_workers=rollout_workers,
+            eval_workers=eval_workers,
             tensorboard_log_dir=resolved_tensorboard_logdir,
         ),
     )

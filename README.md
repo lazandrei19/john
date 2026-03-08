@@ -50,6 +50,8 @@ UPDATES=500 \
 EPISODES_PER_UPDATE=64 \
 EVALUATION_MATCHES=16 \
 EVALUATION_EVERY=10 \
+ROLLOUT_WORKERS=8 \
+EVAL_WORKERS=4 \
 OUTPUT=runs/universal-fast \
 ./scripts/train_universal_model.sh
 ```

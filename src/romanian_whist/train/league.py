@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import random
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from romanian_whist.agents.baselines import BidPlayHeuristicAgent, RandomLegalAgent, SafeHeuristicAgent
 from romanian_whist.agents.checkpoint import save_checkpoint
-from romanian_whist.agents.model import PolicyAgent, WhistPolicyNetwork
+from romanian_whist.agents.model import PolicyAgent, WhistPolicyNetwork, batch_observations, masked_logits
 from romanian_whist.env.romanian_whist import RomanianWhistEnv
 from romanian_whist.rules.config import WhistVariantConfig
 from romanian_whist.train.curriculum import CurriculumScheduler
@@ -35,8 +39,204 @@ class LeagueConfig:
     evaluation_matches: int = 4
     evaluation_interval: int = 1
     evaluation_player_counts: tuple[int, ...] = (3, 4, 5, 6)
+    rollout_workers: int = 1
+    eval_workers: int = 1
     save_best_checkpoint: bool = True
     tensorboard_log_dir: Optional[Path] = None
+
+
+def _policy_state_cpu(policy: WhistPolicyNetwork) -> Dict[str, torch.Tensor]:
+    return {name: tensor.detach().cpu() for name, tensor in policy.state_dict().items()}
+
+
+def _load_cpu_policy(state_dict: Dict[str, torch.Tensor]) -> WhistPolicyNetwork:
+    policy = WhistPolicyNetwork()
+    policy.load_state_dict(state_dict)
+    policy.eval()
+    return policy
+
+
+def _policy_select_action(
+    policy: WhistPolicyNetwork,
+    observation: Dict[str, object],
+    *,
+    greedy: bool,
+) -> tuple[int, float, float]:
+    with torch.no_grad():
+        batch = batch_observations([observation], device=torch.device("cpu"))
+        logits, values = policy(batch)
+        filtered_logits = masked_logits(logits, batch["legal_action_mask"])
+        distribution = torch.distributions.Categorical(logits=filtered_logits)
+        action = torch.argmax(filtered_logits, dim=-1) if greedy else distribution.sample()
+        log_prob = distribution.log_prob(action)
+    return int(action.item()), float(log_prob.item()), float(values.item())
+
+
+def _baseline_agent(role: str, seed: int) -> object:
+    if role == "random":
+        return RandomLegalAgent(seed=seed)
+    if role == "safe":
+        return SafeHeuristicAgent(seed=seed)
+    if role == "heuristic":
+        return BidPlayHeuristicAgent(seed=seed)
+    raise ValueError("Unknown baseline role: {role}".format(role=role))
+
+
+def _chunk_items(items: Sequence[dict], chunks: int) -> List[List[dict]]:
+    if not items:
+        return []
+    chunk_size = int(math.ceil(len(items) / float(max(1, chunks))))
+    return [list(items[index : index + chunk_size]) for index in range(0, len(items), chunk_size)]
+
+
+def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
+    torch.set_num_threads(1)
+    rng = random.Random(int(task["seed"]))
+    torch.manual_seed(int(task["seed"]))
+    latest_policy = _load_cpu_policy(task["latest_policy_state"])
+    snapshot_policies = [_load_cpu_policy(state) for state in task["snapshot_policy_states"]]
+    observations = []
+    actions = []
+    log_probs = []
+    values = []
+    rewards = []
+    dones = []
+
+    for episode in task["episodes"]:
+        config = WhistVariantConfig(
+            players=int(episode["players"]),
+            seed=int(episode["seed"]),
+            one_card_modes=tuple(episode["one_card_modes"]),
+        )
+        env = RomanianWhistEnv(config)
+        env.reset(seed=int(episode["seed"]))
+        focal_seat = int(episode["focal_seat"])
+        focal_agent_name = env.possible_agents[focal_seat]
+        opponent_agents = []
+        for spec in episode["opponent_specs"]:
+            role = spec["role"]
+            if role == "focal":
+                opponent_agents.append(("focal", None))
+            elif role == "latest":
+                opponent_agents.append(("agent", PolicyAgent(latest_policy, device="cpu", greedy=bool(spec.get("greedy", True)))))
+            elif role == "snapshot":
+                snapshot = snapshot_policies[int(spec["snapshot_index"])]
+                opponent_agents.append(("agent", PolicyAgent(snapshot, device="cpu", greedy=bool(spec.get("greedy", True)))))
+            else:
+                opponent_agents.append(("agent", _baseline_agent(role, int(spec["seed"]))))
+
+        last_transition_index = None
+        while not all(env.terminations.values()):
+            acting_agent = env.agent_selection
+            seat = env.agent_index(acting_agent)
+            observation = env.observe(acting_agent)
+            if seat == focal_seat:
+                action, log_prob, value = _policy_select_action(latest_policy, observation, greedy=False)
+                transition = env.step(action)
+                reward = transition.rewards[focal_agent_name]
+                done = transition.terminations[focal_agent_name]
+                observations.append(observation)
+                actions.append(action)
+                log_probs.append(log_prob)
+                values.append(value)
+                rewards.append(reward)
+                dones.append(done)
+                last_transition_index = len(actions) - 1
+            else:
+                action = opponent_agents[seat][1].select_action(observation)
+                transition = env.step(action)
+                if last_transition_index is not None:
+                    rewards[last_transition_index] += transition.rewards[focal_agent_name]
+                    dones[last_transition_index] = transition.terminations[focal_agent_name]
+
+    return {
+        "observations": observations,
+        "actions": actions,
+        "log_probs": log_probs,
+        "values": values,
+        "rewards": rewards,
+        "dones": dones,
+    }
+
+
+def _evaluation_worker(task: Dict[str, object]) -> Dict[str, object]:
+    torch.set_num_threads(1)
+    latest_policy = _load_cpu_policy(task["latest_policy_state"])
+    players = int(task["players"])
+    seed = int(task["seed"])
+    matches = list(task["matches"])
+    config = WhistVariantConfig(players=players, seed=seed)
+    participants = [("policy_0", PolicyAgent(latest_policy, device="cpu", greedy=True))]
+    family_names = ("random", "safe", "heuristic")
+    for seat_index in range(1, players):
+        family_name = family_names[(seat_index - 1) % len(family_names)]
+        label = "{family}_{index}".format(family=family_name, index=seat_index - 1)
+        participants.append((label, _baseline_agent(family_name, seed + 100 + players + seat_index)))
+
+    results = []
+    for match_index in matches:
+        env = RomanianWhistEnv(config)
+        env.reset(seed=seed + int(match_index))
+        rotation = int(match_index) % len(participants)
+        seat_order = participants[rotation:] + participants[:rotation]
+        while not all(env.terminations.values()):
+            acting_agent = env.agent_selection
+            seat = env.agent_index(acting_agent)
+            _, agent = seat_order[seat]
+            env.step(agent.select_action(env.observe(acting_agent)))
+        replay = env.serialize_replay()
+        results.append(
+            {
+                "match_index": int(match_index),
+                "seat_labels": [name for name, _ in seat_order],
+                "final_scores": list(replay["scores"]),
+                "events": replay["events"],
+            }
+        )
+    return {"players": players, "matches": results}
+
+
+def _rollout_worker_loop(task_queue: object, result_queue: object) -> None:
+    torch.set_num_threads(1)
+    while True:
+        item = task_queue.get()
+        if item is None:
+            break
+        task_id, task = item
+        result_queue.put((task_id, _rollout_worker(task)))
+
+
+class PersistentRolloutPool:
+    def __init__(self, workers: int):
+        self.workers = workers
+        ctx = mp.get_context("spawn")
+        self.task_queues = [ctx.Queue() for _ in range(workers)]
+        self.result_queue = ctx.Queue()
+        self.processes = [
+            ctx.Process(target=_rollout_worker_loop, args=(task_queue, self.result_queue), daemon=True)
+            for task_queue in self.task_queues
+        ]
+        for process in self.processes:
+            process.start()
+
+    def map(self, tasks: Sequence[Dict[str, object]]) -> List[Dict[str, list]]:
+        results = [None] * len(tasks)  # type: ignore[list-item]
+        for task_id, task in enumerate(tasks):
+            queue = self.task_queues[task_id % len(self.task_queues)]
+            queue.put((task_id, task))
+        for _ in range(len(tasks)):
+            task_id, result = self.result_queue.get()
+            results[task_id] = result
+        return results  # type: ignore[return-value]
+
+    def close(self) -> None:
+        for task_queue in self.task_queues:
+            task_queue.put(None)
+        for process in self.processes:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=1)
 
 
 @dataclass
@@ -52,6 +252,7 @@ class LeagueTrainer:
         self.curriculum = CurriculumScheduler(self.league_config.total_updates)
         self.snapshots = []  # type: List[WhistPolicyNetwork]
         self.best_selection_score = float("-inf")
+        self.rollout_pool = None  # type: Optional[PersistentRolloutPool]
         self.writer = (
             SummaryWriter(log_dir=str(self.league_config.tensorboard_log_dir))
             if self.league_config.tensorboard_log_dir is not None
@@ -89,6 +290,9 @@ class LeagueTrainer:
                 self._save_checkpoint(update_index, metrics, evaluation)
                 self._save_best_checkpoint(update_index, metrics, evaluation)
         finally:
+            if self.rollout_pool is not None:
+                self.rollout_pool.close()
+                self.rollout_pool = None
             if self.writer is not None:
                 self.writer.flush()
                 self.writer.close()
@@ -100,6 +304,8 @@ class LeagueTrainer:
         one_card_modes: tuple[object, ...],
         episodes: int,
     ) -> RolloutBuffer:
+        if self.league_config.rollout_workers > 1:
+            return self._collect_rollouts_parallel(player_counts, one_card_modes, episodes)
         buffer = RolloutBuffer()
         player_count_schedule = self._player_count_schedule(player_counts, episodes)
         for episode_index, players in enumerate(player_count_schedule):
@@ -136,6 +342,8 @@ class LeagueTrainer:
         return buffer
 
     def evaluate(self, matches: int = 8) -> Dict[str, object]:
+        if self.league_config.eval_workers > 1:
+            return self._evaluate_parallel(matches=matches)
         per_player_count = {}  # type: Dict[str, Dict[str, Dict[str, float]]]
         stat_dicts = []
         for players in self.league_config.evaluation_player_counts:
@@ -143,6 +351,88 @@ class LeagueTrainer:
             participants, label_groups = self._evaluation_participants(players)
             raw_stats = stats_to_dict(runner.run(participants, matches=matches, seed=self.league_config.seed + players))
             stats = self._aggregate_label_groups(raw_stats, label_groups)
+            per_player_count[str(players)] = stats
+            stat_dicts.append(stats)
+        overall = average_stat_dicts(stat_dicts)
+        return {
+            "overall": overall,
+            "by_player_count": per_player_count,
+        }
+
+    def _collect_rollouts_parallel(
+        self,
+        player_counts: tuple[int, ...],
+        one_card_modes: tuple[object, ...],
+        episodes: int,
+    ) -> RolloutBuffer:
+        buffer = RolloutBuffer()
+        player_count_schedule = self._player_count_schedule(player_counts, episodes)
+        worker_count = min(max(1, self.league_config.rollout_workers), len(player_count_schedule))
+        task_episodes = []
+        for episode_index, players in enumerate(player_count_schedule):
+            focal_seat = episode_index % players
+            task_episodes.append(
+                {
+                    "players": players,
+                    "seed": self.rng.randint(0, 1_000_000),
+                    "focal_seat": focal_seat,
+                    "one_card_modes": list(one_card_modes),
+                    "opponent_specs": self._sample_opponent_specs(players, focal_seat),
+                }
+            )
+        latest_policy_state = _policy_state_cpu(self.policy)
+        snapshot_policy_states = [_policy_state_cpu(snapshot) for snapshot in self.snapshots]
+        tasks = [
+            {
+                "seed": self.rng.randint(0, 1_000_000),
+                "episodes": chunk,
+                "latest_policy_state": latest_policy_state,
+                "snapshot_policy_states": snapshot_policy_states,
+            }
+            for chunk in _chunk_items(task_episodes, worker_count)
+        ]
+        if self.rollout_pool is not None and self.rollout_pool.workers != worker_count:
+            self.rollout_pool.close()
+            self.rollout_pool = None
+        if self.rollout_pool is None:
+            self.rollout_pool = PersistentRolloutPool(worker_count)
+        for result in self.rollout_pool.map(tasks):
+            buffer.observations.extend(result["observations"])
+            buffer.actions.extend(result["actions"])
+            buffer.log_probs.extend(result["log_probs"])
+            buffer.values.extend(result["values"])
+            buffer.rewards.extend(result["rewards"])
+            buffer.dones.extend(result["dones"])
+        return buffer
+
+    def _evaluate_parallel(self, matches: int = 8) -> Dict[str, object]:
+        per_player_count = {}  # type: Dict[str, Dict[str, Dict[str, float]]]
+        stat_dicts = []
+        tasks = []
+        worker_cap = max(1, self.league_config.eval_workers)
+        latest_policy_state = _policy_state_cpu(self.policy)
+        for players in self.league_config.evaluation_player_counts:
+            match_specs = [{"match_index": match_index} for match_index in range(matches)]
+            for chunk in _chunk_items(match_specs, min(worker_cap, matches)):
+                tasks.append(
+                    {
+                        "players": players,
+                        "seed": self.league_config.seed + players,
+                        "matches": [item["match_index"] for item in chunk],
+                        "latest_policy_state": latest_policy_state,
+                    }
+                )
+        grouped_results = {}  # type: Dict[int, List[Dict[str, object]]]
+        with ProcessPoolExecutor(max_workers=min(worker_cap, len(tasks))) as executor:
+            for result in executor.map(_evaluation_worker, tasks):
+                grouped_results.setdefault(int(result["players"]), []).extend(result["matches"])
+        for players in self.league_config.evaluation_player_counts:
+            runner = TournamentRunner(self.variant_config.replace(players=players))
+            participants, label_groups = self._evaluation_participants(players)
+            stats = self._aggregate_label_groups(
+                stats_to_dict(runner.summarize_match_results(grouped_results.get(players, []), participants)),
+                label_groups,
+            )
             per_player_count[str(players)] = stats
             stat_dicts.append(stats)
         overall = average_stat_dicts(stat_dicts)
@@ -213,6 +503,23 @@ class LeagueTrainer:
             else:
                 pool.append(PolicyAgent(self.policy, device=self.league_config.device, greedy=True))
         return pool
+
+    def _sample_opponent_specs(self, players: int, focal_seat: int) -> List[Dict[str, object]]:
+        specs = []
+        for seat in range(players):
+            if seat == focal_seat:
+                specs.append({"role": "focal"})
+                continue
+            roll = self.rng.random()
+            if self.snapshots and roll < self.league_config.snapshot_weight:
+                snapshot_index = self.rng.randrange(len(self.snapshots))
+                specs.append({"role": "snapshot", "snapshot_index": snapshot_index, "greedy": True})
+            elif roll < self.league_config.snapshot_weight + self.league_config.scripted_weight:
+                baseline_role = self.rng.choice(("random", "safe", "heuristic"))
+                specs.append({"role": baseline_role, "seed": self.rng.randint(0, 1_000_000)})
+            else:
+                specs.append({"role": "latest", "greedy": True})
+        return specs
 
     def _promote_snapshot(self) -> None:
         snapshot = copy.deepcopy(self.policy).cpu()

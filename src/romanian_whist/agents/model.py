@@ -146,13 +146,16 @@ class PolicyAgent:
     device: str = "cpu"
     greedy: bool = False
 
+    def _policy_device(self) -> torch.device:
+        return next(self.policy.parameters()).device
+
     def select_action(self, observation: Mapping[str, object]) -> int:
         return self.recommend(observation).chosen_action
 
     def recommend(self, observation: Mapping[str, object], top_k: int = 5) -> ActionRecommendation:
         self.policy.eval()
         with torch.no_grad():
-            batch = batch_observations([observation], device=torch.device(self.device))
+            batch = batch_observations([observation], device=self._policy_device())
             logits, values = self.policy(batch)
             legal_mask = batch["legal_action_mask"]
             filtered_logits = masked_logits(logits, legal_mask)

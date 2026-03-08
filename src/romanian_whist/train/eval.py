@@ -106,6 +106,37 @@ class TournamentRunner:
                 elo[player_left] += delta
                 elo[player_right] -= delta
 
+    def summarize_match_results(
+        self,
+        match_results: Sequence[Mapping[str, object]],
+        participants: Sequence[tuple[str, object]],
+    ) -> TournamentStats:
+        score_totals = dict((name, 0.0) for name, _ in participants)
+        contract_hits = dict((name, 0.0) for name, _ in participants)
+        trick_diffs = dict((name, 0.0) for name, _ in participants)
+        elo = dict((name, 1000.0) for name, _ in participants)
+        rounds_per_match = len(self.base_config.schedule())
+
+        for result in sorted(match_results, key=lambda item: int(item["match_index"])):
+            seat_labels = list(result["seat_labels"])
+            final_scores = list(result["final_scores"])
+            for seat, name in enumerate(seat_labels):
+                score_totals[name] += final_scores[seat]
+            contract, trick = self._extract_round_metrics({"events": result["events"]}, seat_labels)
+            for name in contract:
+                contract_hits[name] += contract[name]
+                trick_diffs[name] += trick[name]
+            self._update_elo(elo, seat_labels, final_scores)
+
+        divisor = float(len(match_results))
+        round_divisor = float(len(match_results) * rounds_per_match)
+        return TournamentStats(
+            average_scores=dict((name, score / divisor) for name, score in score_totals.items()),
+            contract_hit_rate=dict((name, value / round_divisor) for name, value in contract_hits.items()),
+            trick_differential=dict((name, value / round_divisor) for name, value in trick_diffs.items()),
+            elo_like=elo,
+        )
+
 
 def stats_to_dict(stats: TournamentStats) -> Dict[str, Dict[str, float]]:
     return {

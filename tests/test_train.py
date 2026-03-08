@@ -1,10 +1,13 @@
 import pathlib
+import platform
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
 from romanian_whist.agents.checkpoint import load_policy_checkpoint
+from romanian_whist.agents.model import PolicyAgent, WhistPolicyNetwork
+from romanian_whist.env.romanian_whist import RomanianWhistEnv
 from romanian_whist.mlx_support.converter import CheckpointConverter
 from romanian_whist.rules.config import WhistVariantConfig
 from romanian_whist.train.league import LeagueConfig, LeagueTrainer
@@ -97,6 +100,62 @@ def test_sparse_evaluation_only_writes_reports_on_interval(tmp_path: pathlib.Pat
     assert "selection_score" in history[1]
     assert not (tmp_path / "update-0001.eval.json").exists()
     assert (tmp_path / "update-0002.eval.json").exists()
+
+
+def test_policy_agent_uses_model_device_for_inference() -> None:
+    env = RomanianWhistEnv(WhistVariantConfig(players=4, seed=3))
+    env.reset(seed=3)
+    agent = PolicyAgent(policy=WhistPolicyNetwork(), device="cuda", greedy=True)
+    action = agent.select_action(env.observe(env.agent_selection))
+    assert isinstance(action, int)
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="Process pool smoke test is not used on Windows here.")
+def test_parallel_rollout_and_evaluation_smoke(tmp_path: pathlib.Path) -> None:
+    trainer = LeagueTrainer(
+        variant_config=WhistVariantConfig(players=4, seed=11),
+        ppo_config=PPOConfig(epochs=1, batch_size=8),
+        league_config=LeagueConfig(
+            total_updates=1,
+            episodes_per_update=2,
+            checkpoint_dir=tmp_path,
+            seed=11,
+            evaluation_matches=2,
+            evaluation_interval=1,
+            evaluation_player_counts=(3, 4),
+            rollout_workers=2,
+            eval_workers=2,
+        ),
+    )
+    history = trainer.train(updates=1)
+    assert history
+    assert (tmp_path / "update-0001.pt").exists()
+    assert (tmp_path / "update-0001.eval.json").exists()
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="Process pool smoke test is not used on Windows here.")
+def test_persistent_rollout_pool_is_reused() -> None:
+    trainer = LeagueTrainer(
+        variant_config=WhistVariantConfig(players=4, seed=13),
+        ppo_config=PPOConfig(epochs=1, batch_size=8),
+        league_config=LeagueConfig(
+            total_updates=1,
+            episodes_per_update=2,
+            seed=13,
+            rollout_workers=2,
+        ),
+    )
+    try:
+        buffer_one = trainer.collect_rollouts((3, 4), (trainer.variant_config.one_card_modes[0],), 2)
+        pool = trainer.rollout_pool
+        buffer_two = trainer.collect_rollouts((3, 4), (trainer.variant_config.one_card_modes[0],), 2)
+        assert pool is trainer.rollout_pool
+        assert len(buffer_one) > 0
+        assert len(buffer_two) > 0
+    finally:
+        if trainer.rollout_pool is not None:
+            trainer.rollout_pool.close()
+            trainer.rollout_pool = None
 
 
 def test_checkpoint_converter_exports_npz(tmp_path: pathlib.Path) -> None:
