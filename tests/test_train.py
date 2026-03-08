@@ -38,6 +38,9 @@ def test_ppo_smoke_and_checkpoint_roundtrip(tmp_path: pathlib.Path) -> None:
     policy, payload = load_policy_checkpoint(checkpoint)
     assert payload["metadata"]["update"] == 1
     assert "overall" in payload["metadata"]["evaluation"]
+    assert "timing/rollout_sec" in payload["metadata"]["metrics"]
+    assert "timing/eval_sec" in payload["metadata"]["metrics"]
+    assert "timing/update_sec" in history[-1]
     assert list(tensorboard_dir.glob("events.out.tfevents.*"))
     assert policy is not None
 

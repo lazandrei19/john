@@ -5,6 +5,7 @@ import json
 import math
 import random
 import multiprocessing as mp
+import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -93,6 +94,7 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
     torch.set_num_threads(1)
     rng = random.Random(int(task["seed"]))
     torch.manual_seed(int(task["seed"]))
+    start_time = time.perf_counter()
     latest_policy = _load_cpu_policy(task["latest_policy_state"])
     snapshot_policies = [_load_cpu_policy(state) for state in task["snapshot_policy_states"]]
     observations = []
@@ -156,11 +158,14 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
         "values": values,
         "rewards": rewards,
         "dones": dones,
+        "episodes": len(task["episodes"]),
+        "elapsed_sec": time.perf_counter() - start_time,
     }
 
 
 def _evaluation_worker(task: Dict[str, object]) -> Dict[str, object]:
     torch.set_num_threads(1)
+    start_time = time.perf_counter()
     latest_policy = _load_cpu_policy(task["latest_policy_state"])
     players = int(task["players"])
     seed = int(task["seed"])
@@ -193,7 +198,12 @@ def _evaluation_worker(task: Dict[str, object]) -> Dict[str, object]:
                 "events": replay["events"],
             }
         )
-    return {"players": players, "matches": results}
+    return {
+        "players": players,
+        "matches": results,
+        "matches_count": len(matches),
+        "elapsed_sec": time.perf_counter() - start_time,
+    }
 
 
 def _rollout_worker_loop(task_queue: object, result_queue: object) -> None:
@@ -253,6 +263,8 @@ class LeagueTrainer:
         self.snapshots = []  # type: List[WhistPolicyNetwork]
         self.best_selection_score = float("-inf")
         self.rollout_pool = None  # type: Optional[PersistentRolloutPool]
+        self.last_rollout_stats = {}  # type: Dict[str, float]
+        self.last_eval_stats = {}  # type: Dict[str, float]
         self.writer = (
             SummaryWriter(log_dir=str(self.league_config.tensorboard_log_dir))
             if self.league_config.tensorboard_log_dir is not None
@@ -271,24 +283,45 @@ class LeagueTrainer:
             for local_update_index in range(total_updates):
                 update_index = start_update + local_update_index + 1
                 stage = self.curriculum.stage_for_update(update_index - 1)
+                update_start = time.perf_counter()
+                rollout_start = time.perf_counter()
                 buffer = self.collect_rollouts(stage.player_counts, stage.one_card_modes, self.league_config.episodes_per_update)
+                rollout_time = time.perf_counter() - rollout_start
+                ppo_start = time.perf_counter()
                 metrics = self.ppo.update(buffer)
+                ppo_time = time.perf_counter() - ppo_start
                 metrics["stage"] = stage.name
                 metrics["transitions"] = float(len(buffer))
+                metrics["timing/rollout_sec"] = rollout_time
+                metrics["timing/ppo_sec"] = ppo_time
+                metrics["timing/transitions_per_sec"] = (
+                    float(len(buffer)) / rollout_time if rollout_time > 0.0 else 0.0
+                )
+                metrics.update(self.last_rollout_stats)
                 evaluation = None
                 should_evaluate = (
                     update_index % self.league_config.evaluation_interval == 0
                     or update_index == start_update + total_updates
                 )
                 if should_evaluate:
+                    eval_start = time.perf_counter()
                     evaluation = self.evaluate(matches=self.league_config.evaluation_matches)
+                    eval_time = time.perf_counter() - eval_start
                     metrics["selection_score"] = self.selection_score(evaluation)
+                    metrics["timing/eval_sec"] = eval_time
+                    metrics.update(self.last_eval_stats)
+                else:
+                    metrics["timing/eval_sec"] = 0.0
                 history.append(metrics)
-                self._log_update(update_index, metrics, evaluation)
                 if update_index % self.league_config.snapshot_interval == 0:
                     self._promote_snapshot()
+                checkpoint_start = time.perf_counter()
                 self._save_checkpoint(update_index, metrics, evaluation)
                 self._save_best_checkpoint(update_index, metrics, evaluation)
+                checkpoint_time = time.perf_counter() - checkpoint_start
+                metrics["timing/checkpoint_sec"] = checkpoint_time
+                metrics["timing/update_sec"] = time.perf_counter() - update_start
+                self._log_update(update_index, metrics, evaluation)
         finally:
             if self.rollout_pool is not None:
                 self.rollout_pool.close()
@@ -306,6 +339,7 @@ class LeagueTrainer:
     ) -> RolloutBuffer:
         if self.league_config.rollout_workers > 1:
             return self._collect_rollouts_parallel(player_counts, one_card_modes, episodes)
+        start_time = time.perf_counter()
         buffer = RolloutBuffer()
         player_count_schedule = self._player_count_schedule(player_counts, episodes)
         for episode_index, players in enumerate(player_count_schedule):
@@ -339,11 +373,19 @@ class LeagueTrainer:
                     if last_transition_index is not None:
                         buffer.rewards[last_transition_index] += transition.rewards[focal_agent_name]
                         buffer.dones[last_transition_index] = transition.terminations[focal_agent_name]
+        elapsed = time.perf_counter() - start_time
+        self.last_rollout_stats = {
+            "rollout/episodes": float(episodes),
+            "rollout/workers_used": 1.0,
+            "rollout/worker_task_sec_mean": elapsed,
+            "rollout/worker_task_sec_max": elapsed,
+        }
         return buffer
 
     def evaluate(self, matches: int = 8) -> Dict[str, object]:
         if self.league_config.eval_workers > 1:
             return self._evaluate_parallel(matches=matches)
+        start_time = time.perf_counter()
         per_player_count = {}  # type: Dict[str, Dict[str, Dict[str, float]]]
         stat_dicts = []
         for players in self.league_config.evaluation_player_counts:
@@ -354,6 +396,12 @@ class LeagueTrainer:
             per_player_count[str(players)] = stats
             stat_dicts.append(stats)
         overall = average_stat_dicts(stat_dicts)
+        self.last_eval_stats = {
+            "eval/matches": float(matches * len(self.league_config.evaluation_player_counts)),
+            "eval/workers_used": 1.0,
+            "eval/worker_task_sec_mean": time.perf_counter() - start_time,
+            "eval/worker_task_sec_max": time.perf_counter() - start_time,
+        }
         return {
             "overall": overall,
             "by_player_count": per_player_count,
@@ -396,13 +444,24 @@ class LeagueTrainer:
             self.rollout_pool = None
         if self.rollout_pool is None:
             self.rollout_pool = PersistentRolloutPool(worker_count)
-        for result in self.rollout_pool.map(tasks):
+        results = self.rollout_pool.map(tasks)
+        worker_elapsed = []
+        for result in results:
             buffer.observations.extend(result["observations"])
             buffer.actions.extend(result["actions"])
             buffer.log_probs.extend(result["log_probs"])
             buffer.values.extend(result["values"])
             buffer.rewards.extend(result["rewards"])
             buffer.dones.extend(result["dones"])
+            worker_elapsed.append(float(result["elapsed_sec"]))
+        self.last_rollout_stats = {
+            "rollout/episodes": float(episodes),
+            "rollout/workers_used": float(worker_count),
+            "rollout/worker_task_sec_mean": (
+                sum(worker_elapsed) / float(len(worker_elapsed)) if worker_elapsed else 0.0
+            ),
+            "rollout/worker_task_sec_max": max(worker_elapsed) if worker_elapsed else 0.0,
+        }
         return buffer
 
     def _evaluate_parallel(self, matches: int = 8) -> Dict[str, object]:
@@ -423,9 +482,11 @@ class LeagueTrainer:
                     }
                 )
         grouped_results = {}  # type: Dict[int, List[Dict[str, object]]]
+        worker_elapsed = []
         with ProcessPoolExecutor(max_workers=min(worker_cap, len(tasks))) as executor:
             for result in executor.map(_evaluation_worker, tasks):
                 grouped_results.setdefault(int(result["players"]), []).extend(result["matches"])
+                worker_elapsed.append(float(result["elapsed_sec"]))
         for players in self.league_config.evaluation_player_counts:
             runner = TournamentRunner(self.variant_config.replace(players=players))
             participants, label_groups = self._evaluation_participants(players)
@@ -436,6 +497,14 @@ class LeagueTrainer:
             per_player_count[str(players)] = stats
             stat_dicts.append(stats)
         overall = average_stat_dicts(stat_dicts)
+        self.last_eval_stats = {
+            "eval/matches": float(matches * len(self.league_config.evaluation_player_counts)),
+            "eval/workers_used": float(min(worker_cap, len(tasks))),
+            "eval/worker_task_sec_mean": (
+                sum(worker_elapsed) / float(len(worker_elapsed)) if worker_elapsed else 0.0
+            ),
+            "eval/worker_task_sec_max": max(worker_elapsed) if worker_elapsed else 0.0,
+        }
         return {
             "overall": overall,
             "by_player_count": per_player_count,
