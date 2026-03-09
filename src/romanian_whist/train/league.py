@@ -42,6 +42,8 @@ class LeagueConfig:
     evaluation_player_counts: tuple[int, ...] = (3, 4, 5, 6)
     rollout_player_counts: Optional[tuple[int, ...]] = None
     rollout_one_card_modes: Optional[tuple[OneCardMode, ...]] = None
+    reward_shaping_coef: float = 0.5
+    imitation_episodes: int = 0
     rollout_workers: int = 1
     eval_workers: int = 1
     save_best_checkpoint: bool = True
@@ -120,6 +122,56 @@ def _baseline_agent(role: str, seed: int) -> object:
     raise ValueError("Unknown baseline role: {role}".format(role=role))
 
 
+def _round_potential(env: RomanianWhistEnv, seat: int) -> float:
+    state = env.game.round_state
+    if state is None:
+        return 0.0
+    bid = state.bids[seat]
+    if bid is None:
+        return 0.0
+    tricks = state.tricks_won[seat]
+    hand_remaining = len(state.hands[seat])
+    max_possible = tricks + hand_remaining
+    over_bid = max(0, tricks - bid)
+    under_bid = max(0, bid - max_possible)
+    denominator = float(max(1, state.hand_size))
+    pressure = abs(bid - tricks) / float(max(1, hand_remaining + 1))
+    return -((over_bid + under_bid) / denominator) - (0.1 * pressure)
+
+
+def _belief_targets(env: RomanianWhistEnv, observer_seat: int, observation: Dict[str, object]) -> tuple[list[int], list[float]]:
+    state = env.game.round_state
+    if state is None:
+        return ([env.config.max_players + 1] * 52, [0.0] * 52)
+    labels = [env.config.max_players + 1 for _ in range(52)]
+    for seat, hand in enumerate(state.hands):
+        for card_id in hand:
+            labels[card_id] = seat
+    for card_id in state.played_cards:
+        labels[card_id] = env.config.max_players
+
+    mask = [1.0 for _ in range(52)]
+    for card_id, enabled in enumerate(observation["hand_mask"]):
+        if int(enabled):
+            mask[card_id] = 0.0
+    for card_id, enabled in enumerate(observation["played_card_mask"]):
+        if int(enabled):
+            mask[card_id] = 0.0
+    for public_card in observation["public_card_by_player"]:
+        card_id = int(public_card)
+        if card_id >= 0:
+            mask[card_id] = 0.0
+    return labels, mask
+
+
+def _training_observation(env: RomanianWhistEnv, seat: int, observation: Dict[str, object]) -> Dict[str, object]:
+    labels, mask = _belief_targets(env, seat, observation)
+    enriched = dict(observation)
+    enriched["belief_target_owner"] = labels
+    enriched["belief_target_mask"] = mask
+    return enriched
+
+
 def _chunk_items(items: Sequence[dict], chunks: int) -> List[List[dict]]:
     if not items:
         return []
@@ -196,6 +248,7 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
             seat = env.agent_index(acting_agent)
             observation = env.observe(acting_agent)
             if seat == state["focal_seat"]:
+                observation = _training_observation(env, seat, observation)
                 policy_batches.setdefault(("latest", -1), []).append(
                     {
                         "state": state,
@@ -207,10 +260,15 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
                 continue
             agent_spec = state["opponent_agents"][seat]
             if agent_spec["kind"] == "scripted":
+                before_potential = _round_potential(env, state["focal_seat"])
                 action = agent_spec["agent"].select_action(observation)
                 transition = env.step(action)
+                after_potential = 0.0 if transition.terminations[state["focal_agent_name"]] else _round_potential(env, state["focal_seat"])
+                shaped_reward = transition.rewards[state["focal_agent_name"]] + (
+                    float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
+                )
                 if state["last_transition_index"] is not None:
-                    rewards[state["last_transition_index"]] += transition.rewards[state["focal_agent_name"]]
+                    rewards[state["last_transition_index"]] += shaped_reward
                     dones[state["last_transition_index"]] = transition.terminations[state["focal_agent_name"]]
                 progress_made = True
                 continue
@@ -242,17 +300,22 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
             )
             for item, (action, log_prob, value) in zip(items, batch_results):
                 state = item["state"]
+                before_potential = _round_potential(state["env"], state["focal_seat"])
                 transition = state["env"].step(action)
+                after_potential = 0.0 if transition.terminations[state["focal_agent_name"]] else _round_potential(state["env"], state["focal_seat"])
+                shaped_reward = transition.rewards[state["focal_agent_name"]] + (
+                    float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
+                )
                 if item["record_transition"]:
                     observations.append(item["observation"])
                     actions.append(action)
                     log_probs.append(log_prob)
                     values.append(value)
-                    rewards.append(transition.rewards[state["focal_agent_name"]])
+                    rewards.append(shaped_reward)
                     dones.append(transition.terminations[state["focal_agent_name"]])
                     state["last_transition_index"] = len(actions) - 1
                 elif state["last_transition_index"] is not None:
-                    rewards[state["last_transition_index"]] += transition.rewards[state["focal_agent_name"]]
+                    rewards[state["last_transition_index"]] += shaped_reward
                     dones[state["last_transition_index"]] = transition.terminations[state["focal_agent_name"]]
                 progress_made = True
 
@@ -389,6 +452,12 @@ class LeagueTrainer:
         total_updates = updates or self.league_config.total_updates
         history = []
         try:
+            if start_update == 0 and self.league_config.imitation_episodes > 0:
+                imitation_metrics = self.pretrain_imitation(self.league_config.imitation_episodes)
+                if self.writer is not None:
+                    for key, value in imitation_metrics.items():
+                        self.writer.add_scalar("pretrain/{key}".format(key=key), float(value), 0)
+                    self.writer.flush()
             for local_update_index in range(total_updates):
                 update_index = start_update + local_update_index + 1
                 stage = self.curriculum.stage_for_update(update_index - 1)
@@ -472,12 +541,17 @@ class LeagueTrainer:
                 seat = env.agent_index(acting_agent)
                 observation = env.observe(acting_agent)
                 if seat == focal_seat:
+                    training_observation = _training_observation(env, seat, observation)
                     action, log_prob, value = self.ppo.select_action(observation)
+                    before_potential = _round_potential(env, focal_seat)
                     transition = env.step(action)
-                    reward = transition.rewards[focal_agent_name]
+                    after_potential = 0.0 if transition.terminations[focal_agent_name] else _round_potential(env, focal_seat)
+                    reward = transition.rewards[focal_agent_name] + (
+                        self.league_config.reward_shaping_coef * (after_potential - before_potential)
+                    )
                     done = transition.terminations[focal_agent_name]
                     last_transition_index = buffer.add(
-                        observation=observation,
+                        observation=training_observation,
                         action=action,
                         log_prob=log_prob,
                         value=value,
@@ -485,10 +559,15 @@ class LeagueTrainer:
                         done=done,
                     )
                 else:
+                    before_potential = _round_potential(env, focal_seat)
                     action = opponent_agents[seat].select_action(observation)
                     transition = env.step(action)
+                    after_potential = 0.0 if transition.terminations[focal_agent_name] else _round_potential(env, focal_seat)
+                    shaped_reward = transition.rewards[focal_agent_name] + (
+                        self.league_config.reward_shaping_coef * (after_potential - before_potential)
+                    )
                     if last_transition_index is not None:
-                        buffer.rewards[last_transition_index] += transition.rewards[focal_agent_name]
+                        buffer.rewards[last_transition_index] += shaped_reward
                         buffer.dones[last_transition_index] = transition.terminations[focal_agent_name]
         elapsed = time.perf_counter() - start_time
         self.last_rollout_stats = {
@@ -549,12 +628,13 @@ class LeagueTrainer:
         snapshot_policy_states = [_policy_state_cpu(snapshot) for snapshot in self.snapshots]
         tasks = [
             {
-                "seed": self.rng.randint(0, 1_000_000),
-                "episodes": chunk,
-                "latest_policy_state": latest_policy_state,
-                "snapshot_policy_states": snapshot_policy_states,
-            }
-            for chunk in _chunk_items(task_episodes, worker_count)
+                    "seed": self.rng.randint(0, 1_000_000),
+                    "episodes": chunk,
+                    "latest_policy_state": latest_policy_state,
+                    "snapshot_policy_states": snapshot_policy_states,
+                    "reward_shaping_coef": self.league_config.reward_shaping_coef,
+                }
+                for chunk in _chunk_items(task_episodes, worker_count)
         ]
         if self.rollout_pool is not None and self.rollout_pool.workers != worker_count:
             self.rollout_pool.close()
@@ -580,6 +660,28 @@ class LeagueTrainer:
             "rollout/worker_task_sec_max": max(worker_elapsed) if worker_elapsed else 0.0,
         }
         return buffer
+
+    def pretrain_imitation(self, episodes: int) -> Dict[str, float]:
+        player_counts = self._rollout_player_counts(self.curriculum.stage_for_update(0).player_counts)
+        one_card_modes = self._rollout_one_card_modes(self.variant_config.one_card_modes)
+        observations = []
+        actions = []
+        teacher_roles = ("safe", "heuristic")
+        for episode_index, players in enumerate(self._player_count_schedule(player_counts, episodes)):
+            teacher_role = teacher_roles[episode_index % len(teacher_roles)]
+            config = self.variant_config.replace(players=players, one_card_modes=tuple(one_card_modes))
+            env = RomanianWhistEnv(config)
+            env.reset(seed=self.rng.randint(0, 1_000_000))
+            teachers = [_baseline_agent(teacher_role, self.rng.randint(0, 1_000_000)) for _ in range(players)]
+            while not all(env.terminations.values()):
+                acting_agent = env.agent_selection
+                seat = env.agent_index(acting_agent)
+                observation = env.observe(acting_agent)
+                observations.append(_training_observation(env, seat, observation))
+                teacher_action = teachers[seat].select_action(observation)
+                actions.append(teacher_action)
+                env.step(teacher_action)
+        return self.ppo.imitation_update(observations, actions)
 
     def _evaluate_parallel(self, matches: int = 8) -> Dict[str, object]:
         per_player_count = {}  # type: Dict[str, Dict[str, Dict[str, float]]]

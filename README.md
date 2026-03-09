@@ -58,6 +58,10 @@ OUTPUT=runs/universal-fast \
 ./scripts/train_universal_model.sh
 ```
 
+Useful training knobs:
+- `REWARD_SHAPING`: scales dense contract-progress shaping during rollouts. Default `0.5`.
+- `IMITATION_EPISODES`: runs behavior-cloning warmup from scripted experts before PPO. Default `128` in the universal script.
+
 ## Six-player training
 
 If real-world play is usually six-handed, train a dedicated 6-player model first:
@@ -79,6 +83,28 @@ EVALUATION_EVERY=5 \
 ROLLOUT_WORKERS=8 \
 EVAL_WORKERS=4 \
 OUTPUT=runs/six-player \
+./scripts/train_6p_model.sh
+```
+
+The 6-player script also enables stronger warm-start settings by default:
+- `REWARD_SHAPING=0.5`
+- `IMITATION_EPISODES=256`
+
+Example long 6-player run with the new shaping and imitation warmup enabled explicitly:
+
+```bash
+DEVICE=cuda \
+UPDATES=300 \
+EPISODES_PER_UPDATE=64 \
+LEARNING_RATE=0.0001 \
+EMBED_DIM=256 \
+EVALUATION_MATCHES=16 \
+EVALUATION_EVERY=5 \
+REWARD_SHAPING=0.5 \
+IMITATION_EPISODES=256 \
+ROLLOUT_WORKERS=8 \
+EVAL_WORKERS=4 \
+OUTPUT=runs/six-player-strong \
 ./scripts/train_6p_model.sh
 ```
 

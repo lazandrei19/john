@@ -251,3 +251,13 @@ def test_fixed_player_count_training_constrains_rollout_counts() -> None:
 
     assert history
     assert captured == [((6,), trainer.curriculum.stage_for_update(0).one_card_modes, 1)]
+
+
+def test_imitation_pretraining_smoke() -> None:
+    trainer = LeagueTrainer(
+        variant_config=WhistVariantConfig(players=4, seed=8),
+        ppo_config=PPOConfig(epochs=1, batch_size=8, imitation_epochs=1, imitation_batch_size=16),
+        league_config=LeagueConfig(total_updates=1, episodes_per_update=1, seed=8, imitation_episodes=2),
+    )
+    metrics = trainer.pretrain_imitation(episodes=2)
+    assert set(metrics.keys()) == {"imitation/loss", "imitation/action_loss", "imitation/belief_loss"}
