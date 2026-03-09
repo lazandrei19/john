@@ -83,6 +83,31 @@ def _policy_select_action(
     return int(action.item()), float(log_prob.item()), float(values.item())
 
 
+def _policy_select_actions(
+    policy: WhistPolicyNetwork,
+    observations: Sequence[Dict[str, object]],
+    *,
+    greedy_flags: Sequence[bool],
+) -> List[tuple[int, float, float]]:
+    with torch.no_grad():
+        batch = batch_observations(list(observations), device=torch.device("cpu"))
+        logits, values = policy(batch)
+        filtered_logits = masked_logits(logits, batch["legal_action_mask"])
+        distribution = torch.distributions.Categorical(logits=filtered_logits)
+        sampled_actions = distribution.sample()
+        greedy_actions = torch.argmax(filtered_logits, dim=-1)
+        actions = torch.where(
+            torch.as_tensor(greedy_flags, dtype=torch.bool, device=filtered_logits.device),
+            greedy_actions,
+            sampled_actions,
+        )
+        log_probs = distribution.log_prob(actions)
+    return [
+        (int(action.item()), float(log_prob.item()), float(value.item()))
+        for action, log_prob, value in zip(actions, log_probs, values)
+    ]
+
+
 def _baseline_agent(role: str, seed: int) -> object:
     if role == "random":
         return RandomLegalAgent(seed=seed)
@@ -114,6 +139,7 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
     rewards = []
     dones = []
 
+    episode_states = []
     for episode in task["episodes"]:
         config = WhistVariantConfig(
             players=int(episode["players"]),
@@ -128,38 +154,108 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
         for spec in episode["opponent_specs"]:
             role = spec["role"]
             if role == "focal":
-                opponent_agents.append(("focal", None))
+                opponent_agents.append({"kind": "focal"})
             elif role == "latest":
-                opponent_agents.append(("agent", PolicyAgent(latest_policy, device="cpu", greedy=bool(spec.get("greedy", True)))))
+                opponent_agents.append({"kind": "latest", "greedy": bool(spec.get("greedy", True))})
             elif role == "snapshot":
-                snapshot = snapshot_policies[int(spec["snapshot_index"])]
-                opponent_agents.append(("agent", PolicyAgent(snapshot, device="cpu", greedy=bool(spec.get("greedy", True)))))
+                opponent_agents.append(
+                    {
+                        "kind": "snapshot",
+                        "snapshot_index": int(spec["snapshot_index"]),
+                        "greedy": bool(spec.get("greedy", True)),
+                    }
+                )
             else:
-                opponent_agents.append(("agent", _baseline_agent(role, int(spec["seed"]))))
+                opponent_agents.append(
+                    {
+                        "kind": "scripted",
+                        "agent": _baseline_agent(role, int(spec["seed"])),
+                    }
+                )
+        episode_states.append(
+            {
+                "env": env,
+                "focal_seat": focal_seat,
+                "focal_agent_name": focal_agent_name,
+                "opponent_agents": opponent_agents,
+                "last_transition_index": None,
+            }
+        )
 
-        last_transition_index = None
-        while not all(env.terminations.values()):
+    while True:
+        active_states = [state for state in episode_states if not all(state["env"].terminations.values())]
+        if not active_states:
+            break
+        policy_batches = {}  # type: Dict[tuple[str, int], List[Dict[str, object]]]
+        progress_made = False
+        for state in active_states:
+            env = state["env"]
             acting_agent = env.agent_selection
             seat = env.agent_index(acting_agent)
             observation = env.observe(acting_agent)
-            if seat == focal_seat:
-                action, log_prob, value = _policy_select_action(latest_policy, observation, greedy=False)
+            if seat == state["focal_seat"]:
+                policy_batches.setdefault(("latest", -1), []).append(
+                    {
+                        "state": state,
+                        "observation": observation,
+                        "greedy": False,
+                        "record_transition": True,
+                    }
+                )
+                continue
+            agent_spec = state["opponent_agents"][seat]
+            if agent_spec["kind"] == "scripted":
+                action = agent_spec["agent"].select_action(observation)
                 transition = env.step(action)
-                reward = transition.rewards[focal_agent_name]
-                done = transition.terminations[focal_agent_name]
-                observations.append(observation)
-                actions.append(action)
-                log_probs.append(log_prob)
-                values.append(value)
-                rewards.append(reward)
-                dones.append(done)
-                last_transition_index = len(actions) - 1
+                if state["last_transition_index"] is not None:
+                    rewards[state["last_transition_index"]] += transition.rewards[state["focal_agent_name"]]
+                    dones[state["last_transition_index"]] = transition.terminations[state["focal_agent_name"]]
+                progress_made = True
+                continue
+            if agent_spec["kind"] == "latest":
+                policy_batches.setdefault(("latest", -1), []).append(
+                    {
+                        "state": state,
+                        "observation": observation,
+                        "greedy": bool(agent_spec["greedy"]),
+                        "record_transition": False,
+                    }
+                )
             else:
-                action = opponent_agents[seat][1].select_action(observation)
-                transition = env.step(action)
-                if last_transition_index is not None:
-                    rewards[last_transition_index] += transition.rewards[focal_agent_name]
-                    dones[last_transition_index] = transition.terminations[focal_agent_name]
+                policy_batches.setdefault(("snapshot", int(agent_spec["snapshot_index"])), []).append(
+                    {
+                        "state": state,
+                        "observation": observation,
+                        "greedy": bool(agent_spec["greedy"]),
+                        "record_transition": False,
+                    }
+                )
+
+        for (policy_kind, snapshot_index), items in policy_batches.items():
+            policy = latest_policy if policy_kind == "latest" else snapshot_policies[snapshot_index]
+            batch_results = _policy_select_actions(
+                policy,
+                [item["observation"] for item in items],
+                greedy_flags=[bool(item["greedy"]) for item in items],
+            )
+            for item, (action, log_prob, value) in zip(items, batch_results):
+                state = item["state"]
+                transition = state["env"].step(action)
+                if item["record_transition"]:
+                    observations.append(item["observation"])
+                    actions.append(action)
+                    log_probs.append(log_prob)
+                    values.append(value)
+                    rewards.append(transition.rewards[state["focal_agent_name"]])
+                    dones.append(transition.terminations[state["focal_agent_name"]])
+                    state["last_transition_index"] = len(actions) - 1
+                elif state["last_transition_index"] is not None:
+                    rewards[state["last_transition_index"]] += transition.rewards[state["focal_agent_name"]]
+                    dones[state["last_transition_index"]] = transition.terminations[state["focal_agent_name"]]
+                progress_made = True
+
+        if not progress_made:
+            raise RuntimeError("Rollout worker made no progress while active environments remain.")
 
     return {
         "observations": observations,
