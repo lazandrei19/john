@@ -109,6 +109,7 @@ def train(
 ) -> None:
     output.mkdir(parents=True, exist_ok=True)
     evaluation_player_counts = (3, 4, 5, 6) if universal else (players,)
+    rollout_player_counts = None if universal else (players,)
     resolved_tensorboard_logdir = tensorboard_logdir or (output / "tensorboard")
     policy_config = PolicyNetworkConfig(embed_dim=embed_dim)
     trainer = LeagueTrainer(
@@ -124,6 +125,7 @@ def train(
             evaluation_matches=evaluation_matches,
             evaluation_interval=evaluation_every,
             evaluation_player_counts=evaluation_player_counts,
+            rollout_player_counts=rollout_player_counts,
             rollout_workers=rollout_workers,
             eval_workers=eval_workers,
             tensorboard_log_dir=resolved_tensorboard_logdir,

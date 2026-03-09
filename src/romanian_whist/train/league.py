@@ -18,7 +18,7 @@ from romanian_whist.agents.baselines import BidPlayHeuristicAgent, RandomLegalAg
 from romanian_whist.agents.checkpoint import save_checkpoint
 from romanian_whist.agents.model import PolicyAgent, PolicyNetworkConfig, WhistPolicyNetwork, batch_observations, masked_logits
 from romanian_whist.env.romanian_whist import RomanianWhistEnv
-from romanian_whist.rules.config import WhistVariantConfig
+from romanian_whist.rules.config import OneCardMode, WhistVariantConfig
 from romanian_whist.train.curriculum import CurriculumScheduler
 from romanian_whist.train.eval import TournamentRunner, average_stat_dicts, stats_to_dict
 from romanian_whist.train.ppo import PPOConfig, PPOTrainer, RolloutBuffer
@@ -40,6 +40,8 @@ class LeagueConfig:
     evaluation_matches: int = 4
     evaluation_interval: int = 1
     evaluation_player_counts: tuple[int, ...] = (3, 4, 5, 6)
+    rollout_player_counts: Optional[tuple[int, ...]] = None
+    rollout_one_card_modes: Optional[tuple[OneCardMode, ...]] = None
     rollout_workers: int = 1
     eval_workers: int = 1
     save_best_checkpoint: bool = True
@@ -390,14 +392,22 @@ class LeagueTrainer:
             for local_update_index in range(total_updates):
                 update_index = start_update + local_update_index + 1
                 stage = self.curriculum.stage_for_update(update_index - 1)
+                rollout_player_counts = self._rollout_player_counts(stage.player_counts)
+                rollout_one_card_modes = self._rollout_one_card_modes(stage.one_card_modes)
                 update_start = time.perf_counter()
                 rollout_start = time.perf_counter()
-                buffer = self.collect_rollouts(stage.player_counts, stage.one_card_modes, self.league_config.episodes_per_update)
+                buffer = self.collect_rollouts(
+                    rollout_player_counts,
+                    rollout_one_card_modes,
+                    self.league_config.episodes_per_update,
+                )
                 rollout_time = time.perf_counter() - rollout_start
                 ppo_start = time.perf_counter()
                 metrics = self.ppo.update(buffer)
                 ppo_time = time.perf_counter() - ppo_start
                 metrics["stage"] = stage.name
+                metrics["rollout_player_counts"] = float(len(rollout_player_counts))
+                metrics["rollout_one_card_modes"] = float(len(rollout_one_card_modes))
                 metrics["transitions"] = float(len(buffer))
                 metrics["timing/rollout_sec"] = rollout_time
                 metrics["timing/ppo_sec"] = ppo_time
@@ -630,6 +640,16 @@ class LeagueTrainer:
             return [self.rng.choice(counts) for _ in range(episodes)]
         self.rng.shuffle(counts)
         return [counts[index % len(counts)] for index in range(episodes)]
+
+    def _rollout_player_counts(self, stage_player_counts: Sequence[int]) -> tuple[int, ...]:
+        if self.league_config.rollout_player_counts is not None:
+            return tuple(self.league_config.rollout_player_counts)
+        return tuple(stage_player_counts)
+
+    def _rollout_one_card_modes(self, stage_one_card_modes: Sequence[OneCardMode]) -> tuple[OneCardMode, ...]:
+        if self.league_config.rollout_one_card_modes is not None:
+            return tuple(self.league_config.rollout_one_card_modes)
+        return tuple(stage_one_card_modes)
 
     def _evaluation_participants(self, players: int) -> tuple[List[tuple[str, object]], Dict[str, str]]:
         participants = [

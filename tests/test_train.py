@@ -1,5 +1,6 @@
 import pathlib
 import platform
+from types import MethodType
 
 import pytest
 
@@ -11,7 +12,7 @@ from romanian_whist.env.romanian_whist import RomanianWhistEnv
 from romanian_whist.mlx_support.converter import CheckpointConverter
 from romanian_whist.rules.config import WhistVariantConfig
 from romanian_whist.train.league import LeagueConfig, LeagueTrainer
-from romanian_whist.train.ppo import PPOConfig
+from romanian_whist.train.ppo import PPOConfig, RolloutBuffer
 
 
 def test_ppo_smoke_and_checkpoint_roundtrip(tmp_path: pathlib.Path) -> None:
@@ -221,3 +222,32 @@ def test_balanced_player_count_schedule_covers_all_counts() -> None:
     )
     schedule = trainer._player_count_schedule((3, 4, 5, 6), 8)
     assert sorted(schedule) == [3, 3, 4, 4, 5, 5, 6, 6]
+
+
+def test_fixed_player_count_training_constrains_rollout_counts() -> None:
+    trainer = LeagueTrainer(
+        variant_config=WhistVariantConfig(players=6, seed=6),
+        ppo_config=PPOConfig(epochs=1, batch_size=8),
+        league_config=LeagueConfig(
+            total_updates=1,
+            episodes_per_update=1,
+            seed=6,
+            evaluation_interval=999,
+            rollout_player_counts=(6,),
+        ),
+    )
+    captured = []
+
+    def fake_collect_rollouts(self: LeagueTrainer, player_counts: tuple[int, ...], one_card_modes: tuple[object, ...], episodes: int) -> RolloutBuffer:
+        captured.append((player_counts, one_card_modes, episodes))
+        return RolloutBuffer()
+
+    trainer.collect_rollouts = MethodType(fake_collect_rollouts, trainer)
+    trainer.ppo.update = lambda buffer: {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}  # type: ignore[method-assign]
+    trainer._save_checkpoint = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    trainer._save_best_checkpoint = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+    history = trainer.train(updates=1)
+
+    assert history
+    assert captured == [((6,), trainer.curriculum.stage_for_update(0).one_card_modes, 1)]
