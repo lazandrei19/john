@@ -6,7 +6,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from romanian_whist.agents.checkpoint import load_policy_checkpoint
-from romanian_whist.agents.model import PolicyAgent, WhistPolicyNetwork
+from romanian_whist.agents.model import PolicyAgent, PolicyNetworkConfig, WhistPolicyNetwork
 from romanian_whist.env.romanian_whist import RomanianWhistEnv
 from romanian_whist.mlx_support.converter import CheckpointConverter
 from romanian_whist.rules.config import WhistVariantConfig
@@ -43,6 +43,26 @@ def test_ppo_smoke_and_checkpoint_roundtrip(tmp_path: pathlib.Path) -> None:
     assert "timing/update_sec" in history[-1]
     assert list(tensorboard_dir.glob("events.out.tfevents.*"))
     assert policy is not None
+
+
+def test_checkpoint_roundtrip_preserves_model_config(tmp_path: pathlib.Path) -> None:
+    trainer = LeagueTrainer(
+        variant_config=WhistVariantConfig(players=6, seed=31),
+        policy_config=PolicyNetworkConfig(embed_dim=256),
+        ppo_config=PPOConfig(epochs=1, batch_size=8),
+        league_config=LeagueConfig(
+            total_updates=1,
+            episodes_per_update=1,
+            checkpoint_dir=tmp_path,
+            seed=31,
+            evaluation_matches=1,
+            evaluation_player_counts=(6,),
+        ),
+    )
+    trainer.train(updates=1)
+    policy, payload = load_policy_checkpoint(tmp_path / "update-0001.pt")
+    assert policy.config.embed_dim == 256
+    assert payload["model_config"]["embed_dim"] == 256
 
 
 def test_resume_training_continues_checkpoint_numbering(tmp_path: pathlib.Path) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Dict, Mapping, Optional
 
 import torch
@@ -52,19 +52,59 @@ class ActionRecommendation:
     value: float
 
 
+@dataclass(frozen=True)
+class PolicyNetworkConfig:
+    embed_dim: int = 128
+    history_vocab_size: int = 256
+    max_players: int = 6
+    max_history_tokens: int = 64
+    card_encoder_layers: int = 2
+    history_encoder_layers: int = 2
+    branch_hidden_multiplier: int = 2
+
+
 class WhistPolicyNetwork(nn.Module):
-    def __init__(self, embed_dim: int = 128, history_vocab_size: int = 256, max_players: int = 6):
+    def __init__(
+        self,
+        embed_dim: int = 128,
+        history_vocab_size: int = 256,
+        max_players: int = 6,
+        max_history_tokens: int = 64,
+        card_encoder_layers: int = 2,
+        history_encoder_layers: int = 2,
+        branch_hidden_multiplier: int = 2,
+    ):
         super().__init__()
+        self.config = PolicyNetworkConfig(
+            embed_dim=embed_dim,
+            history_vocab_size=history_vocab_size,
+            max_players=max_players,
+            max_history_tokens=max_history_tokens,
+            card_encoder_layers=card_encoder_layers,
+            history_encoder_layers=history_encoder_layers,
+            branch_hidden_multiplier=branch_hidden_multiplier,
+        )
         self.embed_dim = embed_dim
         self.max_players = max_players
+        self.max_history_tokens = max_history_tokens
+        self.card_token_count = 1 + 52 + 52 + max_players + max_players
         self.card_embedding = nn.Embedding(53, embed_dim)
         self.history_embedding = nn.Embedding(history_vocab_size, embed_dim, padding_idx=0)
+        self.card_type_embedding = nn.Embedding(5, embed_dim)
+        self.card_seat_embedding = nn.Embedding(max_players + 1, embed_dim)
+        self.card_position_embedding = nn.Embedding(self.card_token_count, embed_dim)
+        self.history_position_embedding = nn.Embedding(max_history_tokens + 1, embed_dim)
+        self.scalar_to_card_context = nn.Sequential(
+            nn.Linear((max_players * 3) + 11, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
         self.scalar_encoder = nn.Sequential(
             nn.Linear((max_players * 3) + 11, embed_dim),
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim),
         )
-        encoder_layer = nn.TransformerEncoderLayer(
+        card_encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=4,
             dim_feedforward=embed_dim * 4,
@@ -72,59 +112,165 @@ class WhistPolicyNetwork(nn.Module):
             batch_first=True,
             activation="gelu",
         )
-        self.history_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        self.torso = nn.Sequential(
-            nn.Linear(embed_dim * 5, embed_dim * 2),
+        history_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=4,
+            dim_feedforward=embed_dim * 4,
+            dropout=0.1,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.card_encoder = nn.TransformerEncoder(card_encoder_layer, num_layers=card_encoder_layers)
+        self.history_encoder = nn.TransformerEncoder(history_encoder_layer, num_layers=history_encoder_layers)
+        self.card_summary_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.history_summary_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        shared_hidden = embed_dim * branch_hidden_multiplier
+        self.shared_trunk = nn.Sequential(
+            nn.Linear(embed_dim * 3, shared_hidden),
             nn.GELU(),
-            nn.LayerNorm(embed_dim * 2),
-            nn.Linear(embed_dim * 2, embed_dim),
+            nn.LayerNorm(shared_hidden),
+            nn.Linear(shared_hidden, embed_dim),
+            nn.GELU(),
+        )
+        self.bid_tower = nn.Sequential(
+            nn.Linear(embed_dim * 3, shared_hidden),
+            nn.GELU(),
+            nn.LayerNorm(shared_hidden),
+            nn.Linear(shared_hidden, embed_dim),
+            nn.GELU(),
+        )
+        self.play_tower = nn.Sequential(
+            nn.Linear(embed_dim * 3, shared_hidden),
+            nn.GELU(),
+            nn.LayerNorm(shared_hidden),
+            nn.Linear(shared_hidden, embed_dim),
+            nn.GELU(),
+        )
+        self.value_tower = nn.Sequential(
+            nn.Linear(embed_dim * 3, shared_hidden),
+            nn.GELU(),
+            nn.LayerNorm(shared_hidden),
+            nn.Linear(shared_hidden, embed_dim),
             nn.GELU(),
         )
         self.bid_head = nn.Linear(embed_dim, 9)
         self.play_head = nn.Linear(embed_dim, 52)
         self.value_head = nn.Linear(embed_dim, 1)
+        nn.init.normal_(self.card_summary_token, std=0.02)
+        nn.init.normal_(self.history_summary_token, std=0.02)
+
+    @classmethod
+    def from_config(cls, config: PolicyNetworkConfig) -> "WhistPolicyNetwork":
+        return cls(
+            embed_dim=config.embed_dim,
+            history_vocab_size=config.history_vocab_size,
+            max_players=config.max_players,
+            max_history_tokens=config.max_history_tokens,
+            card_encoder_layers=config.card_encoder_layers,
+            history_encoder_layers=config.history_encoder_layers,
+            branch_hidden_multiplier=config.branch_hidden_multiplier,
+        )
+
+    def config_dict(self) -> Dict[str, int]:
+        return asdict(self.config)
 
     def forward(self, observation: Dict[str, Tensor]) -> tuple[Tensor, Tensor]:
-        hand_mask = observation["hand_mask"].float()
-        played_mask = observation["played_card_mask"].float()
-        current_trick_cards = observation["current_trick_cards"].long() + 1
-        public_cards = observation["public_card_by_player"].long() + 1
-        history_tokens = observation["history_tokens"].long()
-
-        card_table = self.card_embedding.weight[1:]
-        hand_embedding = self._mask_pool(hand_mask, card_table)
-        played_embedding = self._mask_pool(played_mask, card_table)
-        trick_embedding = self._lookup_pool(current_trick_cards)
-        public_embedding = self._lookup_pool(public_cards)
-
         scalar_features = self._scalar_features(observation)
         scalar_embedding = self.scalar_encoder(scalar_features)
-
-        history_embedding = self.history_embedding(history_tokens)
-        history_encoded = self.history_encoder(history_embedding)
-        history_mask = history_tokens.ne(0).float().unsqueeze(-1)
-        history_sum = (history_encoded * history_mask).sum(dim=1)
-        history_count = history_mask.sum(dim=1).clamp_min(1.0)
-        history_pooled = history_sum / history_count
-
-        torso_input = torch.cat(
-            [hand_embedding, played_embedding, trick_embedding, public_embedding, history_pooled + scalar_embedding], dim=-1
-        )
-        latent = self.torso(torso_input)
-        logits = torch.cat([self.bid_head(latent), self.play_head(latent)], dim=-1)
-        values = self.value_head(latent).squeeze(-1)
+        card_context = self._card_context(observation, scalar_features)
+        history_context = self._history_context(observation, scalar_features)
+        shared_input = torch.cat([card_context, history_context, scalar_embedding], dim=-1)
+        shared_latent = self.shared_trunk(shared_input)
+        bid_latent = self.bid_tower(torch.cat([shared_latent, history_context, scalar_embedding], dim=-1))
+        play_latent = self.play_tower(torch.cat([shared_latent, card_context, history_context], dim=-1))
+        value_latent = self.value_tower(torch.cat([shared_latent, card_context, scalar_embedding], dim=-1))
+        logits = torch.cat([self.bid_head(bid_latent), self.play_head(play_latent)], dim=-1)
+        values = self.value_head(value_latent).squeeze(-1)
         return logits, values
 
-    def _mask_pool(self, mask: Tensor, table: Tensor) -> Tensor:
-        counts = mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        return torch.matmul(mask, table) / counts
+    def _card_context(self, observation: Dict[str, Tensor], scalar_features: Tensor) -> Tensor:
+        batch_size = observation["hand_mask"].shape[0]
+        device = observation["hand_mask"].device
+        card_ids = torch.arange(1, 53, device=device).unsqueeze(0).expand(batch_size, -1)
+        hand_valid = observation["hand_mask"].bool()
+        played_valid = observation["played_card_mask"].bool()
+        trick_cards = observation["current_trick_cards"].long() + 1
+        trick_valid = observation["current_trick_cards"].ge(0)
+        public_cards = observation["public_card_by_player"].long() + 1
+        public_valid = observation["public_card_by_player"].ge(0)
 
-    def _lookup_pool(self, card_ids: Tensor) -> Tensor:
-        embedded = self.card_embedding(card_ids.clamp_min(0))
-        valid = card_ids.gt(0).float().unsqueeze(-1)
-        pooled = (embedded * valid).sum(dim=1)
-        counts = valid.sum(dim=1).clamp_min(1.0)
-        return pooled / counts
+        pad_seat = self.max_players
+        hand_seats = torch.full((batch_size, 52), pad_seat, dtype=torch.long, device=device)
+        played_seats = torch.full((batch_size, 52), pad_seat, dtype=torch.long, device=device)
+        trick_seats = observation["current_trick_players"].long().clamp_min(0)
+        trick_seats = torch.where(trick_valid, trick_seats, torch.full_like(trick_seats, pad_seat))
+        public_seats = torch.arange(self.max_players, device=device).unsqueeze(0).expand(batch_size, -1)
+
+        type_ids = [
+            torch.zeros((batch_size, 1), dtype=torch.long, device=device),
+            torch.full((batch_size, 52), 1, dtype=torch.long, device=device),
+            torch.full((batch_size, 52), 2, dtype=torch.long, device=device),
+            torch.full((batch_size, self.max_players), 3, dtype=torch.long, device=device),
+            torch.full((batch_size, self.max_players), 4, dtype=torch.long, device=device),
+        ]
+        card_token_ids = torch.cat(
+            [
+                torch.zeros((batch_size, 1), dtype=torch.long, device=device),
+                card_ids,
+                card_ids,
+                trick_cards.clamp_min(0),
+                public_cards.clamp_min(0),
+            ],
+            dim=1,
+        )
+        seat_ids = torch.cat(
+            [
+                torch.full((batch_size, 1), pad_seat, dtype=torch.long, device=device),
+                hand_seats,
+                played_seats,
+                trick_seats,
+                public_seats,
+            ],
+            dim=1,
+        )
+        valid_mask = torch.cat(
+            [
+                torch.ones((batch_size, 1), dtype=torch.bool, device=device),
+                hand_valid,
+                played_valid,
+                trick_valid,
+                public_valid,
+            ],
+            dim=1,
+        )
+        token_embeddings = (
+            self.card_embedding(card_token_ids.clamp_min(0))
+            + self.card_type_embedding(torch.cat(type_ids, dim=1))
+            + self.card_seat_embedding(seat_ids)
+            + self.card_position_embedding(
+                torch.arange(self.card_token_count, device=device).unsqueeze(0).expand(batch_size, -1)
+            )
+        )
+        token_embeddings[:, :1, :] = token_embeddings[:, :1, :] + self.card_summary_token + self.scalar_to_card_context(
+            scalar_features
+        ).unsqueeze(1)
+        encoded = self.card_encoder(token_embeddings, src_key_padding_mask=~valid_mask)
+        return encoded[:, 0, :]
+
+    def _history_context(self, observation: Dict[str, Tensor], scalar_features: Tensor) -> Tensor:
+        history_tokens = observation["history_tokens"].long()
+        batch_size = history_tokens.shape[0]
+        device = history_tokens.device
+        history_valid = history_tokens.ne(0)
+        summary_valid = torch.ones((batch_size, 1), dtype=torch.bool, device=device)
+        history_embeddings = self.history_embedding(history_tokens)
+        position_ids = torch.arange(1, history_tokens.shape[1] + 1, device=device).unsqueeze(0).expand(batch_size, -1)
+        history_embeddings = history_embeddings + self.history_position_embedding(position_ids)
+        summary_token = self.history_summary_token + self.scalar_encoder(scalar_features).unsqueeze(1)
+        history_input = torch.cat([summary_token, history_embeddings], dim=1)
+        history_mask = torch.cat([summary_valid, history_valid], dim=1)
+        encoded = self.history_encoder(history_input, src_key_padding_mask=~history_mask)
+        return encoded[:, 0, :]
 
     def _scalar_features(self, observation: Dict[str, Tensor]) -> Tensor:
         keys = ["bids", "tricks_won", "cumulative_scores"]

@@ -7,7 +7,7 @@ import random
 import multiprocessing as mp
 import time
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from romanian_whist.agents.baselines import BidPlayHeuristicAgent, RandomLegalAgent, SafeHeuristicAgent
 from romanian_whist.agents.checkpoint import save_checkpoint
-from romanian_whist.agents.model import PolicyAgent, WhistPolicyNetwork, batch_observations, masked_logits
+from romanian_whist.agents.model import PolicyAgent, PolicyNetworkConfig, WhistPolicyNetwork, batch_observations, masked_logits
 from romanian_whist.env.romanian_whist import RomanianWhistEnv
 from romanian_whist.rules.config import WhistVariantConfig
 from romanian_whist.train.curriculum import CurriculumScheduler
@@ -46,13 +46,23 @@ class LeagueConfig:
     tensorboard_log_dir: Optional[Path] = None
 
 
-def _policy_state_cpu(policy: WhistPolicyNetwork) -> Dict[str, torch.Tensor]:
-    return {name: tensor.detach().cpu() for name, tensor in policy.state_dict().items()}
+def _policy_state_cpu(policy: WhistPolicyNetwork) -> Dict[str, object]:
+    return {
+        "state_dict": {name: tensor.detach().cpu() for name, tensor in policy.state_dict().items()},
+        "config": policy.config_dict(),
+    }
 
 
-def _load_cpu_policy(state_dict: Dict[str, torch.Tensor]) -> WhistPolicyNetwork:
-    policy = WhistPolicyNetwork()
-    policy.load_state_dict(state_dict)
+def _load_cpu_policy(state_bundle: Dict[str, object]) -> WhistPolicyNetwork:
+    raw_config = state_bundle.get("config", {})
+    config = PolicyNetworkConfig(
+        **dict(
+            (field.name, raw_config.get(field.name, field.default))
+            for field in fields(PolicyNetworkConfig)
+        )
+    )
+    policy = WhistPolicyNetwork.from_config(config)
+    policy.load_state_dict(state_bundle["state_dict"])
     policy.eval()
     return policy
 
@@ -254,10 +264,11 @@ class LeagueTrainer:
     variant_config: WhistVariantConfig
     ppo_config: PPOConfig = field(default_factory=PPOConfig)
     league_config: LeagueConfig = field(default_factory=LeagueConfig)
+    policy_config: PolicyNetworkConfig = field(default_factory=PolicyNetworkConfig)
 
     def __post_init__(self) -> None:
         self.rng = random.Random(self.league_config.seed)
-        self.policy = WhistPolicyNetwork()
+        self.policy = WhistPolicyNetwork.from_config(self.policy_config)
         self.ppo = PPOTrainer(self.policy, self.ppo_config, device=self.league_config.device)
         self.curriculum = CurriculumScheduler(self.league_config.total_updates)
         self.snapshots = []  # type: List[WhistPolicyNetwork]

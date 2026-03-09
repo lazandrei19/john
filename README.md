@@ -49,12 +49,37 @@ DEVICE=cuda \
 UPDATES=500 \
 EPISODES_PER_UPDATE=64 \
 LEARNING_RATE=0.0001 \
+EMBED_DIM=128 \
 EVALUATION_MATCHES=16 \
 EVALUATION_EVERY=10 \
 ROLLOUT_WORKERS=8 \
 EVAL_WORKERS=4 \
 OUTPUT=runs/universal-fast \
 ./scripts/train_universal_model.sh
+```
+
+## Six-player training
+
+If real-world play is usually six-handed, train a dedicated 6-player model first:
+
+```bash
+./scripts/train_6p_model.sh
+```
+
+The 6-player script defaults to a larger model and fixed 6-player training:
+
+```bash
+DEVICE=cuda \
+UPDATES=300 \
+EPISODES_PER_UPDATE=32 \
+LEARNING_RATE=0.0001 \
+EMBED_DIM=256 \
+EVALUATION_MATCHES=8 \
+EVALUATION_EVERY=5 \
+ROLLOUT_WORKERS=8 \
+EVAL_WORKERS=4 \
+OUTPUT=runs/six-player \
+./scripts/train_6p_model.sh
 ```
 
 ## Evaluate and play a trained model

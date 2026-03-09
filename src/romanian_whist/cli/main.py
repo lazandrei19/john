@@ -8,7 +8,7 @@ import typer
 
 from romanian_whist.agents.baselines import BidPlayHeuristicAgent, RandomLegalAgent, SafeHeuristicAgent
 from romanian_whist.agents.checkpoint import load_policy_checkpoint
-from romanian_whist.agents.model import PolicyAgent
+from romanian_whist.agents.model import PolicyAgent, PolicyNetworkConfig
 from romanian_whist.env.romanian_whist import RomanianWhistEnv
 from romanian_whist.mlx_support.converter import CheckpointConverter
 from romanian_whist.rules.cards import card_label
@@ -94,6 +94,7 @@ def train(
     updates: int = typer.Option(100, "--updates"),
     episodes_per_update: int = typer.Option(24, "--episodes-per-update"),
     learning_rate: float = typer.Option(3e-4, "--learning-rate"),
+    embed_dim: int = typer.Option(128, "--embed-dim"),
     players: int = typer.Option(4, "--players"),
     seed: int = typer.Option(0, "--seed"),
     device: str = typer.Option("cpu", "--device"),
@@ -109,9 +110,11 @@ def train(
     output.mkdir(parents=True, exist_ok=True)
     evaluation_player_counts = (3, 4, 5, 6) if universal else (players,)
     resolved_tensorboard_logdir = tensorboard_logdir or (output / "tensorboard")
+    policy_config = PolicyNetworkConfig(embed_dim=embed_dim)
     trainer = LeagueTrainer(
         variant_config=_config(players, seed, one_card_modes),
         ppo_config=PPOConfig(learning_rate=learning_rate),
+        policy_config=policy_config,
         league_config=LeagueConfig(
             total_updates=updates,
             episodes_per_update=episodes_per_update,
@@ -129,6 +132,14 @@ def train(
     start_update = 0
     if resume_from is not None:
         policy, payload = load_policy_checkpoint(resume_from, device=device)
+        checkpoint_embed_dim = int(payload.get("model_config", {}).get("embed_dim", embed_dim))
+        if checkpoint_embed_dim != embed_dim:
+            raise typer.BadParameter(
+                "Checkpoint embed_dim is {checkpoint_embed_dim}, but --embed-dim={embed_dim} was requested.".format(
+                    checkpoint_embed_dim=checkpoint_embed_dim,
+                    embed_dim=embed_dim,
+                )
+            )
         trainer.policy.load_state_dict(policy.state_dict())
         optimizer_state = payload.get("optimizer_state")
         if optimizer_state is not None:
@@ -161,6 +172,7 @@ def eval(
     evaluation_player_counts = (3, 4, 5, 6) if universal else (players,)
     trainer = LeagueTrainer(
         variant_config=WhistVariantConfig(players=players, seed=seed),
+        policy_config=policy.config,
         league_config=LeagueConfig(device=device, seed=seed, evaluation_player_counts=evaluation_player_counts),
     )
     trainer.policy.load_state_dict(policy.state_dict())

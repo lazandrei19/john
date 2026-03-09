@@ -22,6 +22,7 @@ class CheckpointConverter:
         metadata = {
             "has_mlx": self.available(),
             "state_dict_keys": sorted(tensor_map.keys()),
+            "model_config": payload.get("model_config", {}),
             "source_checkpoint": str(checkpoint_path),
             "training_metadata": payload.get("metadata", {}),
         }
