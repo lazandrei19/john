@@ -48,6 +48,7 @@ For long CUDA runs, reduce evaluation overhead by evaluating every few updates i
 DEVICE=cuda \
 UPDATES=500 \
 EPISODES_PER_UPDATE=64 \
+LEARNING_RATE=0.0001 \
 EVALUATION_MATCHES=16 \
 EVALUATION_EVERY=10 \
 ROLLOUT_WORKERS=8 \

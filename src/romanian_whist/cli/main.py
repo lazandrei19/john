@@ -93,6 +93,7 @@ def train(
     output: Path = typer.Option(Path("runs/universal"), "--output"),
     updates: int = typer.Option(100, "--updates"),
     episodes_per_update: int = typer.Option(24, "--episodes-per-update"),
+    learning_rate: float = typer.Option(3e-4, "--learning-rate"),
     players: int = typer.Option(4, "--players"),
     seed: int = typer.Option(0, "--seed"),
     device: str = typer.Option("cpu", "--device"),
@@ -110,7 +111,7 @@ def train(
     resolved_tensorboard_logdir = tensorboard_logdir or (output / "tensorboard")
     trainer = LeagueTrainer(
         variant_config=_config(players, seed, one_card_modes),
-        ppo_config=PPOConfig(),
+        ppo_config=PPOConfig(learning_rate=learning_rate),
         league_config=LeagueConfig(
             total_updates=updates,
             episodes_per_update=episodes_per_update,
