@@ -24,6 +24,17 @@ def test_batch_observations_tensorizes_each_observation_once(monkeypatch: pytest
     assert tuple(batch["hand_mask"].shape) == (2, 2)
 
 
+def test_batch_observations_keeps_only_shared_keys() -> None:
+    batch = model_module.batch_observations(
+        [
+            {"hand_mask": [0, 1], "phase": 0, "legal_action_mask": [1, 0], "belief_target_owner": [0, 1]},
+            {"hand_mask": [1, 0], "phase": 1, "legal_action_mask": [0, 1]},
+        ]
+    )
+
+    assert set(batch.keys()) == {"hand_mask", "phase", "legal_action_mask"}
+
+
 def test_policy_forward_with_aux_outputs_belief_logits() -> None:
     env = RomanianWhistEnv(WhistVariantConfig(players=4, seed=7))
     observation = env.reset(seed=7)

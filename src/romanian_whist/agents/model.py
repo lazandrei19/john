@@ -21,9 +21,13 @@ def tensorize_observation(observation: Mapping[str, object], device: Optional[to
 
 def batch_observations(observations: list[Mapping[str, object]], device: Optional[torch.device] = None) -> Dict[str, Tensor]:
     tensorized = [tensorize_observation(obs) for obs in observations]
-    keys = tensorized[0].keys()
+    keys = set(tensorized[0].keys())
+    for obs in tensorized[1:]:
+        keys.intersection_update(obs.keys())
     batches = {}  # type: Dict[str, Tensor]
-    for key in keys:
+    for key in tensorized[0].keys():
+        if key not in keys:
+            continue
         stacked = torch.stack([obs[key] for obs in tensorized], dim=0)
         batches[key] = stacked.to(device=device) if device is not None else stacked
     return batches
