@@ -50,6 +50,7 @@ class LeagueConfig:
     rollout_workers: int = 1
     eval_workers: int = 1
     save_best_checkpoint: bool = True
+    max_active_snapshots: int = 3
     tensorboard_log_dir: Optional[Path] = None
 
 
@@ -103,13 +104,14 @@ def _policy_select_actions(
     *,
     greedy_flags: Sequence[bool],
     device: Optional[torch.device] = None,
+    use_amp: bool = False,
 ) -> List[tuple[int, float, float]]:
     inference_device = device or next(policy.parameters()).device
-    with torch.no_grad():
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
         batch = batch_observations(list(observations), device=inference_device)
         logits, values = policy(batch)
         filtered_logits = masked_logits(logits, batch["legal_action_mask"])
-        distribution = torch.distributions.Categorical(logits=filtered_logits)
+        distribution = torch.distributions.Categorical(logits=filtered_logits.float())
         sampled_actions = distribution.sample()
         greedy_actions = torch.argmax(filtered_logits, dim=-1)
         actions = torch.where(
@@ -141,6 +143,31 @@ def _request_gpu_inference(
             "snapshot_index": snapshot_index,
             "observations": list(observations),
             "greedy_flags": list(greedy_flags),
+        }
+    )
+    return response_queue.get()
+
+
+def _request_gpu_inference_multi(
+    message_queue: object,
+    response_queue: object,
+    worker_index: int,
+    groups: Sequence[tuple[str, int, Sequence[Dict[str, object]], Sequence[bool]]],
+) -> List[List[tuple[int, float, float]]]:
+    """Send all policy groups in a single round-trip to the GPU inference server."""
+    message_queue.put(
+        {
+            "type": "infer_multi",
+            "worker_index": worker_index,
+            "groups": [
+                {
+                    "policy_kind": policy_kind,
+                    "snapshot_index": snapshot_index,
+                    "observations": list(observations),
+                    "greedy_flags": list(greedy_flags),
+                }
+                for policy_kind, snapshot_index, observations, greedy_flags in groups
+            ],
         }
     )
     return response_queue.get()
@@ -337,48 +364,75 @@ def _rollout_worker(
                     }
                 )
 
-        for (policy_kind, snapshot_index), items in policy_batches.items():
-            if use_gpu_inference:
-                batch_results = _request_gpu_inference(
-                    inference_message_queue,
-                    inference_response_queue,
-                    worker_index,
-                    policy_kind,
-                    snapshot_index,
-                    [item["observation"] for item in items],
-                    [bool(item["greedy"]) for item in items],
-                )
-            else:
+        if use_gpu_inference and policy_batches:
+            ordered_keys = list(policy_batches.keys())
+            groups = [
+                (policy_kind, snapshot_index, [item["observation"] for item in policy_batches[(policy_kind, snapshot_index)]], [bool(item["greedy"]) for item in policy_batches[(policy_kind, snapshot_index)]])
+                for policy_kind, snapshot_index in ordered_keys
+            ]
+            multi_results = _request_gpu_inference_multi(
+                inference_message_queue,
+                inference_response_queue,
+                worker_index,
+                groups,
+            )
+            for key, batch_results in zip(ordered_keys, multi_results):
+                for item, (action, log_prob, value) in zip(policy_batches[key], batch_results):
+                    state = item["state"]
+                    before_potential = _round_potential(state["env"], state["focal_seat"])
+                    outcome = state["env"].step_outcome(action)
+                    after_potential = 0.0 if outcome.match_finished else _round_potential(state["env"], state["focal_seat"])
+                    shaped_reward = outcome.rewards[state["focal_seat"]] + (
+                        float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
+                    )
+                    if item["record_transition"]:
+                        if state["last_transition_index"] is not None:
+                            next_values[state["last_transition_index"]] = value
+                        observations.append(item.get("training_observation", item["observation"]))
+                        actions.append(action)
+                        log_probs.append(log_prob)
+                        values.append(value)
+                        next_values.append(0.0)
+                        rewards.append(shaped_reward)
+                        dones.append(outcome.match_finished)
+                        trajectory_ids.append(state["trajectory_id"])
+                        state["last_transition_index"] = len(actions) - 1
+                    elif state["last_transition_index"] is not None:
+                        rewards[state["last_transition_index"]] += shaped_reward
+                        dones[state["last_transition_index"]] = outcome.match_finished
+                    progress_made = True
+        elif policy_batches:
+            for (policy_kind, snapshot_index), items in policy_batches.items():
                 policy = latest_policy if policy_kind == "latest" else snapshot_policies[snapshot_index]
                 batch_results = _policy_select_actions(
                     policy,
                     [item["observation"] for item in items],
                     greedy_flags=[bool(item["greedy"]) for item in items],
                 )
-            for item, (action, log_prob, value) in zip(items, batch_results):
-                state = item["state"]
-                before_potential = _round_potential(state["env"], state["focal_seat"])
-                outcome = state["env"].step_outcome(action)
-                after_potential = 0.0 if outcome.match_finished else _round_potential(state["env"], state["focal_seat"])
-                shaped_reward = outcome.rewards[state["focal_seat"]] + (
-                    float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
-                )
-                if item["record_transition"]:
-                    if state["last_transition_index"] is not None:
-                        next_values[state["last_transition_index"]] = value
-                    observations.append(item.get("training_observation", item["observation"]))
-                    actions.append(action)
-                    log_probs.append(log_prob)
-                    values.append(value)
-                    next_values.append(0.0)
-                    rewards.append(shaped_reward)
-                    dones.append(outcome.match_finished)
-                    trajectory_ids.append(state["trajectory_id"])
-                    state["last_transition_index"] = len(actions) - 1
-                elif state["last_transition_index"] is not None:
-                    rewards[state["last_transition_index"]] += shaped_reward
-                    dones[state["last_transition_index"]] = outcome.match_finished
-                progress_made = True
+                for item, (action, log_prob, value) in zip(items, batch_results):
+                    state = item["state"]
+                    before_potential = _round_potential(state["env"], state["focal_seat"])
+                    outcome = state["env"].step_outcome(action)
+                    after_potential = 0.0 if outcome.match_finished else _round_potential(state["env"], state["focal_seat"])
+                    shaped_reward = outcome.rewards[state["focal_seat"]] + (
+                        float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
+                    )
+                    if item["record_transition"]:
+                        if state["last_transition_index"] is not None:
+                            next_values[state["last_transition_index"]] = value
+                        observations.append(item.get("training_observation", item["observation"]))
+                        actions.append(action)
+                        log_probs.append(log_prob)
+                        values.append(value)
+                        next_values.append(0.0)
+                        rewards.append(shaped_reward)
+                        dones.append(outcome.match_finished)
+                        trajectory_ids.append(state["trajectory_id"])
+                        state["last_transition_index"] = len(actions) - 1
+                    elif state["last_transition_index"] is not None:
+                        rewards[state["last_transition_index"]] += shaped_reward
+                        dones[state["last_transition_index"]] = outcome.match_finished
+                    progress_made = True
 
         if not progress_made:
             raise RuntimeError("Rollout worker made no progress while active environments remain.")
@@ -405,9 +459,20 @@ def _gpu_inference_worker_loop(
 ) -> None:
     torch.set_num_threads(1)
     device = torch.device(device_name)
+    use_amp = device.type == "cuda"
+    use_compile = device.type == "cuda" and hasattr(torch, "compile")
     latest_policy = None  # type: Optional[WhistPolicyNetwork]
     snapshot_policies = []  # type: List[WhistPolicyNetwork]
+    compiled_cache = {}  # type: Dict[int, WhistPolicyNetwork]
     pending_messages = []  # type: List[Dict[str, object]]
+
+    def _maybe_compile(policy: WhistPolicyNetwork) -> WhistPolicyNetwork:
+        if not use_compile:
+            return policy
+        key = id(policy)
+        if key not in compiled_cache:
+            compiled_cache[key] = torch.compile(policy)  # type: ignore[attr-defined]
+        return compiled_cache[key]
 
     while True:
         if pending_messages:
@@ -422,12 +487,56 @@ def _gpu_inference_worker_loop(
         if message_type == "update_models":
             try:
                 latest_policy = _load_policy(message["latest_policy_state"], device=device)
+                compiled_cache.clear()
                 snapshot_states = message.get("snapshot_policy_states")
                 if snapshot_states is not None:
                     snapshot_policies = [_load_policy(state, device=device) for state in snapshot_states]
                 control_result_queue.put({"ok": True})
             except Exception as exc:  # pragma: no cover - exercised via process boundary
                 control_result_queue.put({"ok": False, "error": repr(exc)})
+            continue
+
+        if message_type == "infer_multi":
+            if latest_policy is None:
+                response_queues[int(message["worker_index"])].put(RuntimeError("GPU inference server has no loaded policy."))
+                continue
+            groups = list(message["groups"])
+            group_results = []  # type: List[List[tuple[int, float, float]]]
+            # Coalesce all groups by policy to minimize GPU forward passes
+            policy_batches = {}  # type: Dict[tuple[str, int], List[tuple[int, int, int]]]
+            all_observations = []  # type: List[Dict[str, object]]
+            all_greedy_flags = []  # type: List[bool]
+            for group_index, group in enumerate(groups):
+                key = (str(group["policy_kind"]), int(group["snapshot_index"]))
+                obs = list(group["observations"])
+                flags = [bool(f) for f in group["greedy_flags"]]
+                start = len(all_observations)
+                all_observations.extend(obs)
+                all_greedy_flags.extend(flags)
+                policy_batches.setdefault(key, []).append((group_index, start, len(obs)))
+            # Run one forward pass per distinct policy
+            all_results = [None] * len(all_observations)  # type: ignore[list-item]
+            for (policy_kind, snapshot_index), entries in policy_batches.items():
+                raw_policy = latest_policy if policy_kind == "latest" else snapshot_policies[snapshot_index]
+                policy = _maybe_compile(raw_policy)
+                indices = []
+                for _, start, count in entries:
+                    indices.extend(range(start, start + count))
+                batch_obs = [all_observations[i] for i in indices]
+                batch_flags = [all_greedy_flags[i] for i in indices]
+                batch_results = _policy_select_actions(policy, batch_obs, greedy_flags=batch_flags, device=device, use_amp=use_amp)
+                for idx, result in zip(indices, batch_results):
+                    all_results[idx] = result
+            # Repackage per-group results
+            for group_index, group in enumerate(groups):
+                key = (str(group["policy_kind"]), int(group["snapshot_index"]))
+                obs = list(group["observations"])
+                # Find this group's slice
+                for g_idx, start, count in policy_batches[key]:
+                    if g_idx == group_index:
+                        group_results.append(all_results[start : start + count])  # type: ignore[arg-type]
+                        break
+            response_queues[int(message["worker_index"])].put(group_results)
             continue
 
         if message_type != "infer":
@@ -455,7 +564,8 @@ def _gpu_inference_worker_loop(
 
         request_results = [None] * len(pending_requests)  # type: ignore[list-item]
         for (policy_kind, snapshot_index), grouped_requests in grouped.items():
-            policy = latest_policy if policy_kind == "latest" else snapshot_policies[snapshot_index]
+            raw_policy = latest_policy if policy_kind == "latest" else snapshot_policies[snapshot_index]
+            policy = _maybe_compile(raw_policy)
             flat_observations = []
             flat_greedy_flags = []
             counts = []
@@ -470,6 +580,7 @@ def _gpu_inference_worker_loop(
                 flat_observations,
                 greedy_flags=flat_greedy_flags,
                 device=device,
+                use_amp=use_amp,
             )
             offset = 0
             for (request_index, _), count in zip(grouped_requests, counts):
@@ -657,6 +768,7 @@ class LeagueTrainer:
         self.ppo = PPOTrainer(self.policy, self.ppo_config, device=self.league_config.device)
         self.curriculum = CurriculumScheduler(self.league_config.total_updates)
         self.snapshots = []  # type: List[WhistPolicyNetwork]
+        self.best_snapshot = None  # type: Optional[WhistPolicyNetwork]
         self.best_selection_score = float("-inf")
         self.rollout_pool = None  # type: Optional[PersistentRolloutPool]
         self.gpu_inference_server = None  # type: Optional[PersistentGpuInferenceServer]
@@ -673,6 +785,12 @@ class LeagueTrainer:
             SafeHeuristicAgent(seed=self.league_config.seed + 1),
             BidPlayHeuristicAgent(seed=self.league_config.seed + 2),
         ]
+
+    @property
+    def _all_snapshots(self) -> List[WhistPolicyNetwork]:
+        if self.best_snapshot is None:
+            return self.snapshots
+        return self.snapshots + [self.best_snapshot]
 
     def train(self, updates: Optional[int] = None, start_update: int = 0) -> List[Dict[str, float]]:
         total_updates = updates or self.league_config.total_updates
@@ -755,6 +873,7 @@ class LeagueTrainer:
         buffer = RolloutBuffer()
         player_count_schedule = self._player_count_schedule(player_counts, episodes)
         worker_count = min(max(1, self.league_config.rollout_workers), len(player_count_schedule))
+        active_snapshot_indices = self._select_active_snapshot_indices()
         task_episodes = []
         for episode_index, players in enumerate(player_count_schedule):
             focal_seat = episode_index % players
@@ -765,7 +884,7 @@ class LeagueTrainer:
                     "focal_seat": focal_seat,
                     "trajectory_id": episode_index,
                     "one_card_modes": list(one_card_modes),
-                    "opponent_specs": self._sample_opponent_specs(players, focal_seat),
+                    "opponent_specs": self._sample_opponent_specs(players, focal_seat, active_snapshot_indices),
                 }
             )
 
@@ -781,10 +900,11 @@ class LeagueTrainer:
             self.gpu_inference_server = PersistentGpuInferenceServer(worker_count, self.league_config.device)
 
         latest_policy_state = _policy_state_cpu(self.policy)
-        snapshot_keys = tuple(id(snapshot) for snapshot in self.snapshots)
+        all_snapshots = self._all_snapshots
+        snapshot_keys = tuple(id(snapshot) for snapshot in all_snapshots)
         snapshot_policy_states = None
         if snapshot_keys != self.gpu_inference_snapshot_keys:
-            snapshot_policy_states = [_policy_state_cpu(snapshot) for snapshot in self.snapshots]
+            snapshot_policy_states = [_policy_state_cpu(snapshot) for snapshot in all_snapshots]
             self.gpu_inference_snapshot_keys = snapshot_keys
         self.gpu_inference_server.update_models(latest_policy_state, snapshot_policy_states)
 
@@ -842,13 +962,14 @@ class LeagueTrainer:
         start_time = time.perf_counter()
         buffer = RolloutBuffer()
         player_count_schedule = self._player_count_schedule(player_counts, episodes)
+        active_snapshot_indices = self._select_active_snapshot_indices()
         for episode_index, players in enumerate(player_count_schedule):
             config = self.variant_config.replace(players=players, one_card_modes=tuple(one_card_modes))
             env = RomanianWhistEnv(config)
             env.reset(seed=self.rng.randint(0, 1_000_000))
             focal_seat = episode_index % players
             focal_agent_name = env.possible_agents[focal_seat]
-            opponent_agents = self._sample_opponents(players, focal_seat)
+            opponent_agents = self._sample_opponents(players, focal_seat, active_snapshot_indices)
             last_transition_index = None
             while not all(env.terminations.values()):
                 acting_agent = env.agent_selection
@@ -931,6 +1052,7 @@ class LeagueTrainer:
         buffer = RolloutBuffer()
         player_count_schedule = self._player_count_schedule(player_counts, episodes)
         worker_count = min(max(1, self.league_config.rollout_workers), len(player_count_schedule))
+        active_snapshot_indices = self._select_active_snapshot_indices()
         task_episodes = []
         for episode_index, players in enumerate(player_count_schedule):
             focal_seat = episode_index % players
@@ -941,11 +1063,11 @@ class LeagueTrainer:
                     "focal_seat": focal_seat,
                     "trajectory_id": episode_index,
                     "one_card_modes": list(one_card_modes),
-                    "opponent_specs": self._sample_opponent_specs(players, focal_seat),
+                    "opponent_specs": self._sample_opponent_specs(players, focal_seat, active_snapshot_indices),
                 }
             )
         latest_policy_state = _policy_state_cpu(self.policy)
-        snapshot_policy_states = [_policy_state_cpu(snapshot) for snapshot in self.snapshots]
+        snapshot_policy_states = [_policy_state_cpu(snapshot) for snapshot in self._all_snapshots]
         tasks = [
             {
                     "seed": self.rng.randint(0, 1_000_000),
@@ -1108,15 +1230,19 @@ class LeagueTrainer:
                 )
         return aggregated
 
-    def _sample_opponents(self, players: int, focal_seat: int) -> List[object]:
+    def _sample_opponents(self, players: int, focal_seat: int, active_snapshot_indices: Optional[List[int]] = None) -> List[object]:
+        all_snapshots = self._all_snapshots
+        available_indices = active_snapshot_indices if active_snapshot_indices is not None else (
+            list(range(len(all_snapshots))) if all_snapshots else []
+        )
         pool = []
         for seat in range(players):
             if seat == focal_seat:
                 pool.append(PolicyAgent(self.policy, device=self.league_config.device, greedy=False))
                 continue
             roll = self.rng.random()
-            if self.snapshots and roll < self.league_config.snapshot_weight:
-                snapshot = self.rng.choice(self.snapshots)
+            if available_indices and roll < self.league_config.snapshot_weight:
+                snapshot = all_snapshots[self.rng.choice(available_indices)]
                 pool.append(PolicyAgent(snapshot, device=self.league_config.device, greedy=True))
             elif roll < self.league_config.snapshot_weight + self.league_config.scripted_weight:
                 pool.append(copy.deepcopy(self.rng.choice(self.scripted_pool)))
@@ -1124,15 +1250,29 @@ class LeagueTrainer:
                 pool.append(PolicyAgent(self.policy, device=self.league_config.device, greedy=True))
         return pool
 
-    def _sample_opponent_specs(self, players: int, focal_seat: int) -> List[Dict[str, object]]:
+    def _select_active_snapshot_indices(self) -> List[int]:
+        all_snapshots = self._all_snapshots
+        if not all_snapshots:
+            return []
+        max_active = self.league_config.max_active_snapshots
+        if len(all_snapshots) <= max_active:
+            return list(range(len(all_snapshots)))
+        return self.rng.sample(range(len(all_snapshots)), max_active)
+
+    def _sample_opponent_specs(
+        self, players: int, focal_seat: int, active_snapshot_indices: Optional[List[int]] = None,
+    ) -> List[Dict[str, object]]:
         specs = []
         for seat in range(players):
             if seat == focal_seat:
                 specs.append({"role": "focal"})
                 continue
             roll = self.rng.random()
-            if self.snapshots and roll < self.league_config.snapshot_weight:
-                snapshot_index = self.rng.randrange(len(self.snapshots))
+            available_snapshots = active_snapshot_indices if active_snapshot_indices is not None else (
+                list(range(len(self._all_snapshots))) if self._all_snapshots else []
+            )
+            if available_snapshots and roll < self.league_config.snapshot_weight:
+                snapshot_index = self.rng.choice(available_snapshots)
                 specs.append({"role": "snapshot", "snapshot_index": snapshot_index, "greedy": True})
             elif roll < self.league_config.snapshot_weight + self.league_config.scripted_weight:
                 baseline_role = self.rng.choice(("random", "safe", "heuristic"))
@@ -1169,6 +1309,8 @@ class LeagueTrainer:
         if selection_score <= self.best_selection_score:
             return
         self.best_selection_score = selection_score
+        self.best_snapshot = copy.deepcopy(self.policy).cpu()
+        self.best_snapshot.eval()
         path = self.league_config.checkpoint_dir / "best.pt"
         save_checkpoint(
             path,

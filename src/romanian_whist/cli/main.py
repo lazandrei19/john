@@ -108,6 +108,7 @@ def train(
     imitation_episodes: int = typer.Option(0, "--imitation-episodes"),
     rollout_workers: int = typer.Option(1, "--rollout-workers"),
     eval_workers: int = typer.Option(1, "--eval-workers"),
+    batch_size: int = typer.Option(64, "--batch-size"),
     tensorboard_logdir: Optional[Path] = typer.Option(None, "--tensorboard-logdir"),
     resume_from: Optional[Path] = typer.Option(None, "--resume-from"),
 ) -> None:
@@ -118,7 +119,7 @@ def train(
     policy_config = PolicyNetworkConfig(embed_dim=embed_dim)
     trainer = LeagueTrainer(
         variant_config=_config(players, seed, one_card_modes),
-        ppo_config=PPOConfig(learning_rate=learning_rate, entropy_coef=entropy_coef, gae_lambda=gae_lambda),
+        ppo_config=PPOConfig(learning_rate=learning_rate, entropy_coef=entropy_coef, gae_lambda=gae_lambda, batch_size=batch_size),
         policy_config=policy_config,
         league_config=LeagueConfig(
             total_updates=updates,
@@ -155,10 +156,15 @@ def train(
         metadata = payload.get("metadata", {})
         start_update = int(metadata.get("update", 0))
         best_eval_path = output / "best.eval.json"
+        best_checkpoint_path = output / "best.pt"
         if best_eval_path.exists():
             trainer.best_selection_score = trainer.selection_score(json.loads(best_eval_path.read_text()))
         elif "evaluation" in metadata:
             trainer.best_selection_score = trainer.selection_score(metadata["evaluation"])
+        if best_checkpoint_path.exists():
+            best_policy, _ = load_policy_checkpoint(best_checkpoint_path, device="cpu")
+            best_policy.eval()
+            trainer.best_snapshot = best_policy
         typer.echo(
             "Resuming from {path} at update {update}.".format(path=resume_from, update=start_update)
         )
