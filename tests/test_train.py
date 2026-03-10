@@ -261,3 +261,26 @@ def test_imitation_pretraining_smoke() -> None:
     )
     metrics = trainer.pretrain_imitation(episodes=2)
     assert set(metrics.keys()) == {"imitation/loss", "imitation/action_loss", "imitation/belief_loss"}
+
+
+def test_returns_and_advantages_use_explicit_next_values_for_interleaved_trajectories() -> None:
+    trainer = LeagueTrainer(
+        variant_config=WhistVariantConfig(players=4, seed=12),
+        ppo_config=PPOConfig(gamma=1.0, gae_lambda=1.0, epochs=1, batch_size=8),
+        league_config=LeagueConfig(total_updates=1, episodes_per_update=1, seed=12),
+    )
+    buffer = RolloutBuffer(
+        observations=[{}, {}, {}],
+        actions=[0, 0, 0],
+        log_probs=[0.0, 0.0, 0.0],
+        values=[1.0, 10.0, 2.0],
+        next_values=[2.0, 0.0, 0.0],
+        rewards=[5.0, 7.0, 11.0],
+        dones=[False, True, True],
+        trajectory_ids=[0, 1, 0],
+    )
+
+    returns, advantages = trainer.ppo._returns_and_advantages(buffer)
+
+    assert returns.tolist() == pytest.approx([16.0, 7.0, 11.0])
+    assert advantages.tolist() == pytest.approx([15.0, -3.0, 9.0])

@@ -192,6 +192,8 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
     values = []
     rewards = []
     dones = []
+    next_values = []
+    trajectory_ids = []
 
     episode_states = []
     for episode in task["episodes"]:
@@ -233,6 +235,7 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
                 "focal_agent_name": focal_agent_name,
                 "opponent_agents": opponent_agents,
                 "last_transition_index": None,
+                "trajectory_id": int(episode["trajectory_id"]),
             }
         )
 
@@ -307,12 +310,16 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
                     float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
                 )
                 if item["record_transition"]:
+                    if state["last_transition_index"] is not None:
+                        next_values[state["last_transition_index"]] = value
                     observations.append(item["observation"])
                     actions.append(action)
                     log_probs.append(log_prob)
                     values.append(value)
+                    next_values.append(0.0)
                     rewards.append(shaped_reward)
                     dones.append(transition.terminations[state["focal_agent_name"]])
+                    trajectory_ids.append(state["trajectory_id"])
                     state["last_transition_index"] = len(actions) - 1
                 elif state["last_transition_index"] is not None:
                     rewards[state["last_transition_index"]] += shaped_reward
@@ -327,8 +334,10 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
         "actions": actions,
         "log_probs": log_probs,
         "values": values,
+        "next_values": next_values,
         "rewards": rewards,
         "dones": dones,
+        "trajectory_ids": trajectory_ids,
         "episodes": len(task["episodes"]),
         "elapsed_sec": time.perf_counter() - start_time,
     }
@@ -543,6 +552,8 @@ class LeagueTrainer:
                 if seat == focal_seat:
                     training_observation = _training_observation(env, seat, observation)
                     action, log_prob, value = self.ppo.select_action(observation)
+                    if last_transition_index is not None:
+                        buffer.next_values[last_transition_index] = value
                     before_potential = _round_potential(env, focal_seat)
                     transition = env.step(action)
                     after_potential = 0.0 if transition.terminations[focal_agent_name] else _round_potential(env, focal_seat)
@@ -557,6 +568,7 @@ class LeagueTrainer:
                         value=value,
                         reward=reward,
                         done=done,
+                        trajectory_id=episode_index,
                     )
                 else:
                     before_potential = _round_potential(env, focal_seat)
@@ -620,6 +632,7 @@ class LeagueTrainer:
                     "players": players,
                     "seed": self.rng.randint(0, 1_000_000),
                     "focal_seat": focal_seat,
+                    "trajectory_id": episode_index,
                     "one_card_modes": list(one_card_modes),
                     "opponent_specs": self._sample_opponent_specs(players, focal_seat),
                 }
@@ -648,8 +661,10 @@ class LeagueTrainer:
             buffer.actions.extend(result["actions"])
             buffer.log_probs.extend(result["log_probs"])
             buffer.values.extend(result["values"])
+            buffer.next_values.extend(result["next_values"])
             buffer.rewards.extend(result["rewards"])
             buffer.dones.extend(result["dones"])
+            buffer.trajectory_ids.extend(result["trajectory_ids"])
             worker_elapsed.append(float(result["elapsed_sec"]))
         self.last_rollout_stats = {
             "rollout/episodes": float(episodes),

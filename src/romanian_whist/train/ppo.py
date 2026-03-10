@@ -34,8 +34,10 @@ class RolloutBuffer:
     actions: List[int] = field(default_factory=list)
     log_probs: List[float] = field(default_factory=list)
     values: List[float] = field(default_factory=list)
+    next_values: List[float] = field(default_factory=list)
     rewards: List[float] = field(default_factory=list)
     dones: List[bool] = field(default_factory=list)
+    trajectory_ids: List[int] = field(default_factory=list)
 
     def add(
         self,
@@ -45,13 +47,16 @@ class RolloutBuffer:
         value: float,
         reward: float,
         done: bool,
+        trajectory_id: int = 0,
     ) -> int:
         self.observations.append(observation)
         self.actions.append(action)
         self.log_probs.append(log_prob)
         self.values.append(value)
+        self.next_values.append(0.0)
         self.rewards.append(reward)
         self.dones.append(done)
+        self.trajectory_ids.append(trajectory_id)
         return len(self.actions) - 1
 
     def __len__(self) -> int:
@@ -182,17 +187,21 @@ class PPOTrainer:
 
     def _returns_and_advantages(self, buffer: RolloutBuffer) -> tuple[np.ndarray, np.ndarray]:
         rewards = np.asarray(buffer.rewards, dtype=np.float32)
-        values = np.asarray(buffer.values + [0.0], dtype=np.float32)
+        values = np.asarray(buffer.values, dtype=np.float32)
+        next_values = np.asarray(buffer.next_values, dtype=np.float32)
         dones = np.asarray(buffer.dones, dtype=np.float32)
+        trajectory_ids = np.asarray(buffer.trajectory_ids, dtype=np.int64)
 
         advantages = np.zeros_like(rewards)
-        gae = 0.0
-        for step in reversed(range(len(rewards))):
-            mask = 1.0 - dones[step]
-            delta = rewards[step] + (self.config.gamma * values[step + 1] * mask) - values[step]
-            gae = delta + (self.config.gamma * self.config.gae_lambda * mask * gae)
-            advantages[step] = gae
-        returns = advantages + values[:-1]
+        for trajectory_id in np.unique(trajectory_ids):
+            gae = 0.0
+            indices = np.nonzero(trajectory_ids == trajectory_id)[0]
+            for step in reversed(indices):
+                mask = 1.0 - dones[step]
+                delta = rewards[step] + (self.config.gamma * next_values[step] * mask) - values[step]
+                gae = delta + (self.config.gamma * self.config.gae_lambda * mask * gae)
+                advantages[step] = gae
+        returns = advantages + values
         return returns, advantages
 
     def _belief_loss(self, outputs: PolicyForwardOutputs, batch_obs: Dict[str, Tensor]) -> Tensor:
