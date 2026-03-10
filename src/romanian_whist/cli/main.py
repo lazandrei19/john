@@ -102,6 +102,8 @@ def train(
     universal: bool = typer.Option(True, "--universal/--fixed-player-count"),
     evaluation_matches: int = typer.Option(4, "--evaluation-matches"),
     evaluation_every: int = typer.Option(1, "--evaluation-every"),
+    entropy_coef: float = typer.Option(0.01, "--entropy-coef"),
+    gae_lambda: float = typer.Option(0.95, "--gae-lambda"),
     reward_shaping: float = typer.Option(0.5, "--reward-shaping"),
     imitation_episodes: int = typer.Option(0, "--imitation-episodes"),
     rollout_workers: int = typer.Option(1, "--rollout-workers"),
@@ -116,7 +118,7 @@ def train(
     policy_config = PolicyNetworkConfig(embed_dim=embed_dim)
     trainer = LeagueTrainer(
         variant_config=_config(players, seed, one_card_modes),
-        ppo_config=PPOConfig(learning_rate=learning_rate),
+        ppo_config=PPOConfig(learning_rate=learning_rate, entropy_coef=entropy_coef, gae_lambda=gae_lambda),
         policy_config=policy_config,
         league_config=LeagueConfig(
             total_updates=updates,
