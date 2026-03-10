@@ -9,6 +9,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from queue import Empty
 from typing import Dict, List, Optional, Sequence
 
 import torch
@@ -22,6 +23,8 @@ from romanian_whist.rules.config import OneCardMode, WhistVariantConfig
 from romanian_whist.train.curriculum import CurriculumScheduler
 from romanian_whist.train.eval import TournamentRunner, average_stat_dicts, stats_to_dict
 from romanian_whist.train.ppo import PPOConfig, PPOTrainer, RolloutBuffer
+
+SCRIPTED_AGENT_TYPES = (RandomLegalAgent, SafeHeuristicAgent, BidPlayHeuristicAgent)
 
 
 @dataclass
@@ -57,7 +60,7 @@ def _policy_state_cpu(policy: WhistPolicyNetwork) -> Dict[str, object]:
     }
 
 
-def _load_cpu_policy(state_bundle: Dict[str, object]) -> WhistPolicyNetwork:
+def _load_policy(state_bundle: Dict[str, object], device: str | torch.device = "cpu") -> WhistPolicyNetwork:
     raw_config = state_bundle.get("config", {})
     config = PolicyNetworkConfig(
         **dict(
@@ -67,8 +70,13 @@ def _load_cpu_policy(state_bundle: Dict[str, object]) -> WhistPolicyNetwork:
     )
     policy = WhistPolicyNetwork.from_config(config)
     policy.load_state_dict(state_bundle["state_dict"])
+    policy.to(device)
     policy.eval()
     return policy
+
+
+def _load_cpu_policy(state_bundle: Dict[str, object]) -> WhistPolicyNetwork:
+    return _load_policy(state_bundle, device="cpu")
 
 
 def _policy_select_action(
@@ -76,9 +84,11 @@ def _policy_select_action(
     observation: Dict[str, object],
     *,
     greedy: bool,
+    device: Optional[torch.device] = None,
 ) -> tuple[int, float, float]:
+    inference_device = device or next(policy.parameters()).device
     with torch.no_grad():
-        batch = batch_observations([observation], device=torch.device("cpu"))
+        batch = batch_observations([observation], device=inference_device)
         logits, values = policy(batch)
         filtered_logits = masked_logits(logits, batch["legal_action_mask"])
         distribution = torch.distributions.Categorical(logits=filtered_logits)
@@ -92,9 +102,11 @@ def _policy_select_actions(
     observations: Sequence[Dict[str, object]],
     *,
     greedy_flags: Sequence[bool],
+    device: Optional[torch.device] = None,
 ) -> List[tuple[int, float, float]]:
+    inference_device = device or next(policy.parameters()).device
     with torch.no_grad():
-        batch = batch_observations(list(observations), device=torch.device("cpu"))
+        batch = batch_observations(list(observations), device=inference_device)
         logits, values = policy(batch)
         filtered_logits = masked_logits(logits, batch["legal_action_mask"])
         distribution = torch.distributions.Categorical(logits=filtered_logits)
@@ -110,6 +122,28 @@ def _policy_select_actions(
         (int(action.item()), float(log_prob.item()), float(value.item()))
         for action, log_prob, value in zip(actions, log_probs, values)
     ]
+
+
+def _request_gpu_inference(
+    message_queue: object,
+    response_queue: object,
+    worker_index: int,
+    policy_kind: str,
+    snapshot_index: int,
+    observations: Sequence[Dict[str, object]],
+    greedy_flags: Sequence[bool],
+) -> List[tuple[int, float, float]]:
+    message_queue.put(
+        {
+            "type": "infer",
+            "worker_index": worker_index,
+            "policy_kind": policy_kind,
+            "snapshot_index": snapshot_index,
+            "observations": list(observations),
+            "greedy_flags": list(greedy_flags),
+        }
+    )
+    return response_queue.get()
 
 
 def _baseline_agent(role: str, seed: int) -> object:
@@ -179,13 +213,20 @@ def _chunk_items(items: Sequence[dict], chunks: int) -> List[List[dict]]:
     return [list(items[index : index + chunk_size]) for index in range(0, len(items), chunk_size)]
 
 
-def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
+def _rollout_worker(
+    task: Dict[str, object],
+    *,
+    inference_message_queue: Optional[object] = None,
+    inference_response_queue: Optional[object] = None,
+    worker_index: int = 0,
+) -> Dict[str, list]:
     torch.set_num_threads(1)
     rng = random.Random(int(task["seed"]))
     torch.manual_seed(int(task["seed"]))
     start_time = time.perf_counter()
-    latest_policy = _load_cpu_policy(task["latest_policy_state"])
-    snapshot_policies = [_load_cpu_policy(state) for state in task["snapshot_policy_states"]]
+    use_gpu_inference = inference_message_queue is not None and inference_response_queue is not None
+    latest_policy = None if use_gpu_inference else _load_cpu_policy(task["latest_policy_state"])
+    snapshot_policies = [] if use_gpu_inference else [_load_cpu_policy(state) for state in task["snapshot_policy_states"]]
     observations = []
     actions = []
     log_probs = []
@@ -249,13 +290,14 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
             env = state["env"]
             acting_agent = env.agent_selection
             seat = env.agent_index(acting_agent)
-            observation = env.observe(acting_agent)
             if seat == state["focal_seat"]:
-                observation = _training_observation(env, seat, observation)
+                policy_observation = env.observe(acting_agent)
+                observation = _training_observation(env, seat, policy_observation)
                 policy_batches.setdefault(("latest", -1), []).append(
                     {
                         "state": state,
-                        "observation": observation,
+                        "observation": policy_observation,
+                        "training_observation": observation,
                         "greedy": False,
                         "record_transition": True,
                     }
@@ -264,17 +306,18 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
             agent_spec = state["opponent_agents"][seat]
             if agent_spec["kind"] == "scripted":
                 before_potential = _round_potential(env, state["focal_seat"])
-                action = agent_spec["agent"].select_action(observation)
-                transition = env.step(action)
-                after_potential = 0.0 if transition.terminations[state["focal_agent_name"]] else _round_potential(env, state["focal_seat"])
-                shaped_reward = transition.rewards[state["focal_agent_name"]] + (
+                action = agent_spec["agent"].select_action_from_game(env.game, seat)
+                outcome = env.step_outcome(action)
+                after_potential = 0.0 if outcome.match_finished else _round_potential(env, state["focal_seat"])
+                shaped_reward = outcome.rewards[state["focal_seat"]] + (
                     float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
                 )
                 if state["last_transition_index"] is not None:
                     rewards[state["last_transition_index"]] += shaped_reward
-                    dones[state["last_transition_index"]] = transition.terminations[state["focal_agent_name"]]
+                    dones[state["last_transition_index"]] = outcome.match_finished
                 progress_made = True
                 continue
+            observation = env.observe(acting_agent)
             if agent_spec["kind"] == "latest":
                 policy_batches.setdefault(("latest", -1), []).append(
                     {
@@ -295,35 +338,46 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
                 )
 
         for (policy_kind, snapshot_index), items in policy_batches.items():
-            policy = latest_policy if policy_kind == "latest" else snapshot_policies[snapshot_index]
-            batch_results = _policy_select_actions(
-                policy,
-                [item["observation"] for item in items],
-                greedy_flags=[bool(item["greedy"]) for item in items],
-            )
+            if use_gpu_inference:
+                batch_results = _request_gpu_inference(
+                    inference_message_queue,
+                    inference_response_queue,
+                    worker_index,
+                    policy_kind,
+                    snapshot_index,
+                    [item["observation"] for item in items],
+                    [bool(item["greedy"]) for item in items],
+                )
+            else:
+                policy = latest_policy if policy_kind == "latest" else snapshot_policies[snapshot_index]
+                batch_results = _policy_select_actions(
+                    policy,
+                    [item["observation"] for item in items],
+                    greedy_flags=[bool(item["greedy"]) for item in items],
+                )
             for item, (action, log_prob, value) in zip(items, batch_results):
                 state = item["state"]
                 before_potential = _round_potential(state["env"], state["focal_seat"])
-                transition = state["env"].step(action)
-                after_potential = 0.0 if transition.terminations[state["focal_agent_name"]] else _round_potential(state["env"], state["focal_seat"])
-                shaped_reward = transition.rewards[state["focal_agent_name"]] + (
+                outcome = state["env"].step_outcome(action)
+                after_potential = 0.0 if outcome.match_finished else _round_potential(state["env"], state["focal_seat"])
+                shaped_reward = outcome.rewards[state["focal_seat"]] + (
                     float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
                 )
                 if item["record_transition"]:
                     if state["last_transition_index"] is not None:
                         next_values[state["last_transition_index"]] = value
-                    observations.append(item["observation"])
+                    observations.append(item.get("training_observation", item["observation"]))
                     actions.append(action)
                     log_probs.append(log_prob)
                     values.append(value)
                     next_values.append(0.0)
                     rewards.append(shaped_reward)
-                    dones.append(transition.terminations[state["focal_agent_name"]])
+                    dones.append(outcome.match_finished)
                     trajectory_ids.append(state["trajectory_id"])
                     state["last_transition_index"] = len(actions) - 1
                 elif state["last_transition_index"] is not None:
                     rewards[state["last_transition_index"]] += shaped_reward
-                    dones[state["last_transition_index"]] = transition.terminations[state["focal_agent_name"]]
+                    dones[state["last_transition_index"]] = outcome.match_finished
                 progress_made = True
 
         if not progress_made:
@@ -341,6 +395,89 @@ def _rollout_worker(task: Dict[str, object]) -> Dict[str, list]:
         "episodes": len(task["episodes"]),
         "elapsed_sec": time.perf_counter() - start_time,
     }
+
+
+def _gpu_inference_worker_loop(
+    message_queue: object,
+    control_result_queue: object,
+    response_queues: Sequence[object],
+    device_name: str,
+) -> None:
+    torch.set_num_threads(1)
+    device = torch.device(device_name)
+    latest_policy = None  # type: Optional[WhistPolicyNetwork]
+    snapshot_policies = []  # type: List[WhistPolicyNetwork]
+    pending_messages = []  # type: List[Dict[str, object]]
+
+    while True:
+        if pending_messages:
+            message = pending_messages.pop(0)
+        else:
+            message = message_queue.get()
+        message_type = str(message["type"])
+
+        if message_type == "close":
+            break
+
+        if message_type == "update_models":
+            try:
+                latest_policy = _load_policy(message["latest_policy_state"], device=device)
+                snapshot_states = message.get("snapshot_policy_states")
+                if snapshot_states is not None:
+                    snapshot_policies = [_load_policy(state, device=device) for state in snapshot_states]
+                control_result_queue.put({"ok": True})
+            except Exception as exc:  # pragma: no cover - exercised via process boundary
+                control_result_queue.put({"ok": False, "error": repr(exc)})
+            continue
+
+        if message_type != "infer":
+            continue
+
+        if latest_policy is None:
+            response_queues[int(message["worker_index"])].put(RuntimeError("GPU inference server has no loaded policy."))
+            continue
+
+        pending_requests = [message]
+        while True:
+            try:
+                extra = message_queue.get_nowait()
+            except Empty:
+                break
+            if str(extra["type"]) == "infer":
+                pending_requests.append(extra)
+            else:
+                pending_messages.append(extra)
+
+        grouped = {}  # type: Dict[tuple[str, int], List[tuple[int, Dict[str, object]]]]
+        for request_index, request in enumerate(pending_requests):
+            key = (str(request["policy_kind"]), int(request["snapshot_index"]))
+            grouped.setdefault(key, []).append((request_index, request))
+
+        request_results = [None] * len(pending_requests)  # type: ignore[list-item]
+        for (policy_kind, snapshot_index), grouped_requests in grouped.items():
+            policy = latest_policy if policy_kind == "latest" else snapshot_policies[snapshot_index]
+            flat_observations = []
+            flat_greedy_flags = []
+            counts = []
+            for _, request in grouped_requests:
+                observations = list(request["observations"])
+                greedy_flags = list(request["greedy_flags"])
+                flat_observations.extend(observations)
+                flat_greedy_flags.extend(bool(flag) for flag in greedy_flags)
+                counts.append(len(observations))
+            flat_results = _policy_select_actions(
+                policy,
+                flat_observations,
+                greedy_flags=flat_greedy_flags,
+                device=device,
+            )
+            offset = 0
+            for (request_index, _), count in zip(grouped_requests, counts):
+                request_results[request_index] = flat_results[offset : offset + count]
+                offset += count
+
+        for request, result in zip(pending_requests, request_results):
+            response_queues[int(request["worker_index"])].put(result)
 
 
 def _evaluation_worker(task: Dict[str, object]) -> Dict[str, object]:
@@ -368,7 +505,11 @@ def _evaluation_worker(task: Dict[str, object]) -> Dict[str, object]:
             acting_agent = env.agent_selection
             seat = env.agent_index(acting_agent)
             _, agent = seat_order[seat]
-            env.step(agent.select_action(env.observe(acting_agent)))
+            if isinstance(agent, SCRIPTED_AGENT_TYPES):
+                action = agent.select_action_from_game(env.game, seat)
+            else:
+                action = agent.select_action(env.observe(acting_agent))
+            env.step(action, include_observation=False)
         replay = env.serialize_replay()
         results.append(
             {
@@ -386,25 +527,99 @@ def _evaluation_worker(task: Dict[str, object]) -> Dict[str, object]:
     }
 
 
-def _rollout_worker_loop(task_queue: object, result_queue: object) -> None:
+def _rollout_worker_loop(
+    task_queue: object,
+    result_queue: object,
+    worker_index: int,
+    inference_message_queue: Optional[object] = None,
+    inference_response_queue: Optional[object] = None,
+) -> None:
     torch.set_num_threads(1)
     while True:
         item = task_queue.get()
         if item is None:
             break
         task_id, task = item
-        result_queue.put((task_id, _rollout_worker(task)))
+        result_queue.put(
+            (
+                task_id,
+                _rollout_worker(
+                    task,
+                    inference_message_queue=inference_message_queue,
+                    inference_response_queue=inference_response_queue,
+                    worker_index=worker_index,
+                ),
+            )
+        )
+
+
+class PersistentGpuInferenceServer:
+    def __init__(self, workers: int, device: str):
+        self.workers = workers
+        self.device = device
+        ctx = mp.get_context("spawn")
+        self.message_queue = ctx.Queue()
+        self.control_result_queue = ctx.Queue()
+        self.response_queues = [ctx.Queue() for _ in range(workers)]
+        self.process = ctx.Process(
+            target=_gpu_inference_worker_loop,
+            args=(self.message_queue, self.control_result_queue, self.response_queues, device),
+            daemon=True,
+        )
+        self.process.start()
+
+    def update_models(
+        self,
+        latest_policy_state: Dict[str, object],
+        snapshot_policy_states: Optional[Sequence[Dict[str, object]]],
+    ) -> None:
+        self.message_queue.put(
+            {
+                "type": "update_models",
+                "latest_policy_state": latest_policy_state,
+                "snapshot_policy_states": list(snapshot_policy_states) if snapshot_policy_states is not None else None,
+            }
+        )
+        result = self.control_result_queue.get()
+        if not bool(result.get("ok", False)):
+            raise RuntimeError("GPU inference server failed to load policies: {error}".format(error=result.get("error", "unknown")))
+
+    def response_queue(self, worker_index: int) -> object:
+        return self.response_queues[worker_index]
+
+    def close(self) -> None:
+        self.message_queue.put({"type": "close"})
+        self.process.join(timeout=5)
+        if self.process.is_alive():
+            self.process.kill()
+            self.process.join(timeout=1)
 
 
 class PersistentRolloutPool:
-    def __init__(self, workers: int):
+    def __init__(
+        self,
+        workers: int,
+        *,
+        inference_message_queue: Optional[object] = None,
+        inference_response_queues: Optional[Sequence[object]] = None,
+    ):
         self.workers = workers
         ctx = mp.get_context("spawn")
         self.task_queues = [ctx.Queue() for _ in range(workers)]
         self.result_queue = ctx.Queue()
         self.processes = [
-            ctx.Process(target=_rollout_worker_loop, args=(task_queue, self.result_queue), daemon=True)
-            for task_queue in self.task_queues
+            ctx.Process(
+                target=_rollout_worker_loop,
+                args=(
+                    task_queue,
+                    self.result_queue,
+                    index,
+                    inference_message_queue,
+                    None if inference_response_queues is None else inference_response_queues[index],
+                ),
+                daemon=True,
+            )
+            for index, task_queue in enumerate(self.task_queues)
         ]
         for process in self.processes:
             process.start()
@@ -444,6 +659,8 @@ class LeagueTrainer:
         self.snapshots = []  # type: List[WhistPolicyNetwork]
         self.best_selection_score = float("-inf")
         self.rollout_pool = None  # type: Optional[PersistentRolloutPool]
+        self.gpu_inference_server = None  # type: Optional[PersistentGpuInferenceServer]
+        self.gpu_inference_snapshot_keys = ()  # type: tuple[int, ...]
         self.last_rollout_stats = {}  # type: Dict[str, float]
         self.last_eval_stats = {}  # type: Dict[str, float]
         self.writer = (
@@ -521,204 +738,94 @@ class LeagueTrainer:
             if self.rollout_pool is not None:
                 self.rollout_pool.close()
                 self.rollout_pool = None
+            if self.gpu_inference_server is not None:
+                self.gpu_inference_server.close()
+                self.gpu_inference_server = None
             if self.writer is not None:
                 self.writer.flush()
                 self.writer.close()
         return history
 
-    def _collect_rollouts_gpu_batched(
+    def _collect_rollouts_parallel_gpu_inference(
         self,
         player_counts: tuple[int, ...],
         one_card_modes: tuple[object, ...],
         episodes: int,
     ) -> RolloutBuffer:
-        start_time = time.perf_counter()
         buffer = RolloutBuffer()
-        device = torch.device(self.league_config.device)
         player_count_schedule = self._player_count_schedule(player_counts, episodes)
-
-        gpu_snapshots = []
-        for snapshot in self.snapshots:
-            gpu_snap = copy.deepcopy(snapshot).to(device)
-            gpu_snap.eval()
-            gpu_snapshots.append(gpu_snap)
-        self.policy.eval()
-
-        episode_states = []
+        worker_count = min(max(1, self.league_config.rollout_workers), len(player_count_schedule))
+        task_episodes = []
         for episode_index, players in enumerate(player_count_schedule):
-            config = self.variant_config.replace(players=players, one_card_modes=tuple(one_card_modes))
-            env = RomanianWhistEnv(config)
-            env.reset(seed=self.rng.randint(0, 1_000_000))
             focal_seat = episode_index % players
-            focal_agent_name = env.possible_agents[focal_seat]
-            opponent_specs = self._sample_opponent_specs(players, focal_seat)
-            scripted_agents = {}
-            for seat, spec in enumerate(opponent_specs):
-                if spec["role"] not in ("focal", "latest", "snapshot"):
-                    scripted_agents[seat] = _baseline_agent(spec["role"], int(spec["seed"]))
-            episode_states.append(
+            task_episodes.append(
                 {
-                    "env": env,
+                    "players": players,
+                    "seed": self.rng.randint(0, 1_000_000),
                     "focal_seat": focal_seat,
-                    "focal_agent_name": focal_agent_name,
-                    "opponent_specs": opponent_specs,
-                    "scripted_agents": scripted_agents,
-                    "last_transition_index": None,
                     "trajectory_id": episode_index,
+                    "one_card_modes": list(one_card_modes),
+                    "opponent_specs": self._sample_opponent_specs(players, focal_seat),
                 }
             )
 
-        while True:
-            active_states = [state for state in episode_states if not all(state["env"].terminations.values())]
-            if not active_states:
-                break
-            focal_items = []  # type: List[Dict[str, object]]
-            policy_batches = {}  # type: Dict[tuple[str, int], List[Dict[str, object]]]
-            progress_made = False
+        if self.rollout_pool is not None and self.rollout_pool.workers != worker_count:
+            self.rollout_pool.close()
+            self.rollout_pool = None
+        if self.gpu_inference_server is not None and self.gpu_inference_server.workers != worker_count:
+            self.gpu_inference_server.close()
+            self.gpu_inference_server = None
+            self.gpu_inference_snapshot_keys = ()
 
-            for state in active_states:
-                env = state["env"]
-                acting_agent = env.agent_selection
-                seat = env.agent_index(acting_agent)
-                observation = env.observe(acting_agent)
+        if self.gpu_inference_server is None:
+            self.gpu_inference_server = PersistentGpuInferenceServer(worker_count, self.league_config.device)
 
-                if seat == state["focal_seat"]:
-                    training_obs = _training_observation(env, seat, observation)
-                    focal_items.append(
-                        {
-                            "state": state,
-                            "observation": training_obs,
-                        }
-                    )
-                    continue
+        latest_policy_state = _policy_state_cpu(self.policy)
+        snapshot_keys = tuple(id(snapshot) for snapshot in self.snapshots)
+        snapshot_policy_states = None
+        if snapshot_keys != self.gpu_inference_snapshot_keys:
+            snapshot_policy_states = [_policy_state_cpu(snapshot) for snapshot in self.snapshots]
+            self.gpu_inference_snapshot_keys = snapshot_keys
+        self.gpu_inference_server.update_models(latest_policy_state, snapshot_policy_states)
 
-                spec = state["opponent_specs"][seat]
-                role = spec["role"]
+        if self.rollout_pool is None:
+            self.rollout_pool = PersistentRolloutPool(
+                worker_count,
+                inference_message_queue=self.gpu_inference_server.message_queue,
+                inference_response_queues=self.gpu_inference_server.response_queues,
+            )
 
-                if role in ("random", "safe", "heuristic"):
-                    agent = state["scripted_agents"][seat]
-                    before_potential = _round_potential(env, state["focal_seat"])
-                    action = agent.select_action(observation)
-                    transition = env.step(action)
-                    after_potential = (
-                        0.0
-                        if transition.terminations[state["focal_agent_name"]]
-                        else _round_potential(env, state["focal_seat"])
-                    )
-                    shaped_reward = transition.rewards[state["focal_agent_name"]] + (
-                        self.league_config.reward_shaping_coef * (after_potential - before_potential)
-                    )
-                    if state["last_transition_index"] is not None:
-                        buffer.rewards[state["last_transition_index"]] += shaped_reward
-                        buffer.dones[state["last_transition_index"]] = transition.terminations[state["focal_agent_name"]]
-                    progress_made = True
-                    continue
+        tasks = [
+            {
+                "seed": self.rng.randint(0, 1_000_000),
+                "episodes": chunk,
+                "latest_policy_state": latest_policy_state,
+                "snapshot_policy_states": [],
+                "reward_shaping_coef": self.league_config.reward_shaping_coef,
+            }
+            for chunk in _chunk_items(task_episodes, worker_count)
+        ]
 
-                if role == "latest":
-                    policy_batches.setdefault(("latest", -1), []).append(
-                        {
-                            "state": state,
-                            "observation": observation,
-                            "greedy": bool(spec.get("greedy", True)),
-                        }
-                    )
-                elif role == "snapshot":
-                    snapshot_index = int(spec["snapshot_index"])
-                    policy_batches.setdefault(("snapshot", snapshot_index), []).append(
-                        {
-                            "state": state,
-                            "observation": observation,
-                            "greedy": bool(spec.get("greedy", True)),
-                        }
-                    )
-
-            if focal_items:
-                with torch.no_grad():
-                    batch = batch_observations(
-                        [item["observation"] for item in focal_items],
-                        device=device,
-                    )
-                    logits, values_t = self.policy(batch)
-                    filtered = masked_logits(logits, batch["legal_action_mask"])
-                    dist = torch.distributions.Categorical(logits=filtered)
-                    actions_t = dist.sample()
-                    log_probs_t = dist.log_prob(actions_t)
-                actions_list = actions_t.cpu().tolist()
-                log_probs_list = log_probs_t.cpu().tolist()
-                values_list = values_t.cpu().tolist()
-                for item, action, log_prob, value in zip(focal_items, actions_list, log_probs_list, values_list):
-                    state = item["state"]
-                    if state["last_transition_index"] is not None:
-                        buffer.next_values[state["last_transition_index"]] = value
-                    before_potential = _round_potential(state["env"], state["focal_seat"])
-                    transition = state["env"].step(action)
-                    after_potential = (
-                        0.0
-                        if transition.terminations[state["focal_agent_name"]]
-                        else _round_potential(state["env"], state["focal_seat"])
-                    )
-                    shaped_reward = transition.rewards[state["focal_agent_name"]] + (
-                        self.league_config.reward_shaping_coef * (after_potential - before_potential)
-                    )
-                    buffer.add(
-                        observation=item["observation"],
-                        action=action,
-                        log_prob=log_prob,
-                        value=value,
-                        reward=shaped_reward,
-                        done=transition.terminations[state["focal_agent_name"]],
-                        trajectory_id=state["trajectory_id"],
-                    )
-                    state["last_transition_index"] = len(buffer) - 1
-                progress_made = True
-
-            for (kind, index), items in policy_batches.items():
-                policy = self.policy if kind == "latest" else gpu_snapshots[index]
-                with torch.no_grad():
-                    batch = batch_observations(
-                        [item["observation"] for item in items],
-                        device=device,
-                    )
-                    logits, values_t = policy(batch)
-                    filtered = masked_logits(logits, batch["legal_action_mask"])
-                    dist = torch.distributions.Categorical(logits=filtered)
-                    sampled = dist.sample()
-                    greedy = torch.argmax(filtered, dim=-1)
-                    greedy_flags = torch.as_tensor(
-                        [item["greedy"] for item in items],
-                        dtype=torch.bool,
-                        device=device,
-                    )
-                    actions_t = torch.where(greedy_flags, greedy, sampled)
-                actions_list = actions_t.cpu().tolist()
-                for item, action in zip(items, actions_list):
-                    state = item["state"]
-                    before_potential = _round_potential(state["env"], state["focal_seat"])
-                    transition = state["env"].step(action)
-                    after_potential = (
-                        0.0
-                        if transition.terminations[state["focal_agent_name"]]
-                        else _round_potential(state["env"], state["focal_seat"])
-                    )
-                    shaped_reward = transition.rewards[state["focal_agent_name"]] + (
-                        self.league_config.reward_shaping_coef * (after_potential - before_potential)
-                    )
-                    if state["last_transition_index"] is not None:
-                        buffer.rewards[state["last_transition_index"]] += shaped_reward
-                        buffer.dones[state["last_transition_index"]] = transition.terminations[state["focal_agent_name"]]
-                progress_made = True
-
-            if not progress_made:
-                raise RuntimeError("GPU batched rollout made no progress while active environments remain.")
-
-        del gpu_snapshots
-        elapsed = time.perf_counter() - start_time
+        results = self.rollout_pool.map(tasks)
+        worker_elapsed = []
+        for result in results:
+            buffer.observations.extend(result["observations"])
+            buffer.actions.extend(result["actions"])
+            buffer.log_probs.extend(result["log_probs"])
+            buffer.values.extend(result["values"])
+            buffer.next_values.extend(result["next_values"])
+            buffer.rewards.extend(result["rewards"])
+            buffer.dones.extend(result["dones"])
+            buffer.trajectory_ids.extend(result["trajectory_ids"])
+            worker_elapsed.append(float(result["elapsed_sec"]))
         self.last_rollout_stats = {
             "rollout/episodes": float(episodes),
-            "rollout/workers_used": 1.0,
-            "rollout/gpu_batched": 1.0,
-            "rollout/worker_task_sec_mean": elapsed,
-            "rollout/worker_task_sec_max": elapsed,
+            "rollout/workers_used": float(worker_count),
+            "rollout/gpu_inference_server": 1.0,
+            "rollout/worker_task_sec_mean": (
+                sum(worker_elapsed) / float(len(worker_elapsed)) if worker_elapsed else 0.0
+            ),
+            "rollout/worker_task_sec_max": max(worker_elapsed) if worker_elapsed else 0.0,
         }
         return buffer
 
@@ -728,9 +835,9 @@ class LeagueTrainer:
         one_card_modes: tuple[object, ...],
         episodes: int,
     ) -> RolloutBuffer:
-        if self.league_config.device.startswith("cuda"):
-            return self._collect_rollouts_gpu_batched(player_counts, one_card_modes, episodes)
         if self.league_config.rollout_workers > 1:
+            if self.league_config.device.startswith("cuda"):
+                return self._collect_rollouts_parallel_gpu_inference(player_counts, one_card_modes, episodes)
             return self._collect_rollouts_parallel(player_counts, one_card_modes, episodes)
         start_time = time.perf_counter()
         buffer = RolloutBuffer()
@@ -746,19 +853,21 @@ class LeagueTrainer:
             while not all(env.terminations.values()):
                 acting_agent = env.agent_selection
                 seat = env.agent_index(acting_agent)
-                observation = env.observe(acting_agent)
+                scripted_agent = opponent_agents[seat] if seat != focal_seat and isinstance(opponent_agents[seat], SCRIPTED_AGENT_TYPES) else None
+                observation = env.observe(acting_agent) if scripted_agent is None else None
                 if seat == focal_seat:
+                    assert observation is not None
                     training_observation = _training_observation(env, seat, observation)
                     action, log_prob, value = self.ppo.select_action(observation)
                     if last_transition_index is not None:
                         buffer.next_values[last_transition_index] = value
                     before_potential = _round_potential(env, focal_seat)
-                    transition = env.step(action)
-                    after_potential = 0.0 if transition.terminations[focal_agent_name] else _round_potential(env, focal_seat)
-                    reward = transition.rewards[focal_agent_name] + (
+                    outcome = env.step_outcome(action)
+                    after_potential = 0.0 if outcome.match_finished else _round_potential(env, focal_seat)
+                    reward = outcome.rewards[focal_seat] + (
                         self.league_config.reward_shaping_coef * (after_potential - before_potential)
                     )
-                    done = transition.terminations[focal_agent_name]
+                    done = outcome.match_finished
                     last_transition_index = buffer.add(
                         observation=training_observation,
                         action=action,
@@ -770,15 +879,15 @@ class LeagueTrainer:
                     )
                 else:
                     before_potential = _round_potential(env, focal_seat)
-                    action = opponent_agents[seat].select_action(observation)
-                    transition = env.step(action)
-                    after_potential = 0.0 if transition.terminations[focal_agent_name] else _round_potential(env, focal_seat)
-                    shaped_reward = transition.rewards[focal_agent_name] + (
+                    action = scripted_agent.select_action_from_game(env.game, seat) if scripted_agent is not None else opponent_agents[seat].select_action(observation)
+                    outcome = env.step_outcome(action)
+                    after_potential = 0.0 if outcome.match_finished else _round_potential(env, focal_seat)
+                    shaped_reward = outcome.rewards[focal_seat] + (
                         self.league_config.reward_shaping_coef * (after_potential - before_potential)
                     )
                     if last_transition_index is not None:
                         buffer.rewards[last_transition_index] += shaped_reward
-                        buffer.dones[last_transition_index] = transition.terminations[focal_agent_name]
+                        buffer.dones[last_transition_index] = outcome.match_finished
         elapsed = time.perf_counter() - start_time
         self.last_rollout_stats = {
             "rollout/episodes": float(episodes),
@@ -891,9 +1000,9 @@ class LeagueTrainer:
                 seat = env.agent_index(acting_agent)
                 observation = env.observe(acting_agent)
                 observations.append(_training_observation(env, seat, observation))
-                teacher_action = teachers[seat].select_action(observation)
+                teacher_action = teachers[seat].select_action_from_game(env.game, seat)
                 actions.append(teacher_action)
-                env.step(teacher_action)
+                env.step(teacher_action, include_observation=False)
         return self.ppo.imitation_update(observations, actions)
 
     def _evaluate_parallel(self, matches: int = 8) -> Dict[str, object]:

@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Mapping, Sequence
 
+from romanian_whist.agents.baselines import BidPlayHeuristicAgent, RandomLegalAgent, SafeHeuristicAgent
 from romanian_whist.env.romanian_whist import RomanianWhistEnv
 from romanian_whist.rules.config import WhistVariantConfig
+
+SCRIPTED_AGENT_TYPES = (RandomLegalAgent, SafeHeuristicAgent, BidPlayHeuristicAgent)
 
 
 @dataclass
@@ -48,8 +51,11 @@ class TournamentRunner:
                 acting_agent = env.agent_selection
                 seat = env.agent_index(acting_agent)
                 agent_name, agent = seat_order[seat]
-                action = agent.select_action(env.observe(acting_agent))
-                env.step(action)
+                if isinstance(agent, SCRIPTED_AGENT_TYPES):
+                    action = agent.select_action_from_game(env.game, seat)
+                else:
+                    action = agent.select_action(env.observe(acting_agent))
+                env.step(action, include_observation=False)
 
             replay = env.serialize_replay()
             final_scores = replay["scores"]

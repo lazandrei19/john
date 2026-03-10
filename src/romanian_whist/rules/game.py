@@ -195,6 +195,33 @@ class RomanianWhistGame:
         }
         return observation
 
+    def observe_for_baseline(self, player: int) -> Dict[str, np.ndarray]:
+        if self.round_state is None:
+            raise RuntimeError("Game has not been reset.")
+        state = self.round_state
+        hand_mask = np.zeros(52, dtype=np.int8)
+        for card_id in self._visible_hand_for_player(player):
+            hand_mask[card_id] = 1
+
+        current_trick_cards = np.full(self.config.max_players, PAD_CARD_ID, dtype=np.int16)
+        for index, (_, card_id) in enumerate(state.current_trick):
+            current_trick_cards[index] = card_id
+
+        legal_mask = np.zeros(ACTION_COUNT, dtype=np.int8)
+        if player == self.current_player and not self.match_finished:
+            for action in self.legal_actions(player):
+                legal_mask[action] = 1
+
+        return {
+            "hand_mask": hand_mask,
+            "current_trick_cards": current_trick_cards,
+            "legal_action_mask": legal_mask,
+            "trump_suit": np.array(state.trump_suit if state.trump_suit is not None else PAD_VALUE, dtype=np.int8),
+            "lead_suit": np.array(state.lead_suit if state.lead_suit is not None else PAD_VALUE, dtype=np.int8),
+            "hand_size": np.array(state.hand_size, dtype=np.int8),
+            "phase": np.array(0 if state.phase == "bidding" else 1, dtype=np.int8),
+        }
+
     def step(self, action: int) -> StepOutcome:
         if self.round_state is None:
             raise RuntimeError("Game has not been reset.")
@@ -371,6 +398,9 @@ class RomanianWhistGame:
         if state.one_card_mode in (OneCardMode.FOREHEAD, OneCardMode.BLIND):
             return []
         return state.hands[player]
+
+    def visible_hand_for_player(self, player: int) -> Sequence[int]:
+        return self._visible_hand_for_player(player)
 
     def _public_card_for_player(self, observer: int, target: int) -> int:
         if self.round_state is None or self.round_state.hand_size != 1:

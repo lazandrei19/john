@@ -76,7 +76,8 @@ class PPOTrainer:
             self.scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
 
     def select_action(self, observation: Mapping[str, object]) -> tuple[int, float, float]:
-        self.policy.eval()
+        if self.policy.training:
+            self.policy.eval()
         with torch.no_grad():
             batch = batch_observations([observation], device=torch.device(self.device))
             outputs = self.policy.forward_with_aux(batch)
@@ -90,13 +91,14 @@ class PPOTrainer:
         if not buffer:
             return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "belief_loss": 0.0}
 
+        self.policy.train()
         returns, advantages = self._returns_and_advantages(buffer)
         observations = batch_observations(buffer.observations, device=torch.device(self.device))
         actions = torch.as_tensor(buffer.actions, dtype=torch.long, device=self.device)
         old_log_probs = torch.as_tensor(buffer.log_probs, dtype=torch.float32, device=self.device)
         returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
         advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
-        advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std().clamp_min(1e-6))
+        advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std(unbiased=False).clamp_min(1e-6))
 
         metrics = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "belief_loss": 0.0}
         indices = np.arange(len(buffer))
@@ -152,6 +154,7 @@ class PPOTrainer:
         if not observations:
             return {"imitation/loss": 0.0, "imitation/action_loss": 0.0, "imitation/belief_loss": 0.0}
 
+        self.policy.train()
         batched = batch_observations(observations, device=torch.device(self.device))
         target_actions = torch.as_tensor(actions, dtype=torch.long, device=self.device)
         metrics = {"imitation/loss": 0.0, "imitation/action_loss": 0.0, "imitation/belief_loss": 0.0}

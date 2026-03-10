@@ -7,14 +7,19 @@ from typing import Dict, List, Sequence
 import numpy as np
 
 from romanian_whist.rules.cards import rank, suit
+from romanian_whist.rules.game import RomanianWhistGame
 from romanian_whist.rules.game import CARD_ACTION_OFFSET
 
 
 def legal_actions_from_mask(mask: Sequence[int]) -> List[int]:
+    if isinstance(mask, np.ndarray):
+        return np.flatnonzero(mask).tolist()
     return [index for index, enabled in enumerate(mask) if enabled]
 
 
 def card_ids_from_mask(mask: Sequence[int]) -> List[int]:
+    if isinstance(mask, np.ndarray):
+        return np.flatnonzero(mask).tolist()
     return [index for index, enabled in enumerate(mask) if enabled]
 
 
@@ -27,6 +32,12 @@ class RandomLegalAgent:
 
     def select_action(self, observation: Dict[str, np.ndarray]) -> int:
         legal_actions = legal_actions_from_mask(observation["legal_action_mask"])
+        if not legal_actions:
+            raise ValueError("No legal actions available.")
+        return self.rng.choice(legal_actions)
+
+    def select_action_from_game(self, game: RomanianWhistGame, player: int) -> int:
+        legal_actions = game.legal_actions(player)
         if not legal_actions:
             raise ValueError("No legal actions available.")
         return self.rng.choice(legal_actions)
@@ -45,9 +56,50 @@ class SafeHeuristicAgent:
             return self._choose_bid(observation, legal_actions)
         return self._choose_card(observation, legal_actions, aggressive=False)
 
+    def select_action_from_game(self, game: RomanianWhistGame, player: int) -> int:
+        state = game.round_state
+        if state is None:
+            raise RuntimeError("Game has not been reset.")
+        legal_actions = game.legal_actions(player)
+        if state.phase == "bidding":
+            return self._choose_bid_from_cards(
+                game.visible_hand_for_player(player),
+                state.trump_suit,
+                state.hand_size,
+                legal_actions,
+            )
+        return self._choose_card_from_state(state.current_trick, state.lead_suit, state.trump_suit, legal_actions, aggressive=False)
+
     def _choose_bid(self, observation: Dict[str, np.ndarray], legal_actions: List[int]) -> int:
-        visible_cards = card_ids_from_mask(observation["hand_mask"])
-        trump_suit = int(observation["trump_suit"])
+        return self._choose_bid_from_cards(
+            card_ids_from_mask(observation["hand_mask"]),
+            int(observation["trump_suit"]),
+            int(observation["hand_size"]),
+            legal_actions,
+        )
+
+    def _choose_card(
+        self,
+        observation: Dict[str, np.ndarray],
+        legal_actions: List[int],
+        aggressive: bool,
+    ) -> int:
+        current_trick = [int(card) for card in observation["current_trick_cards"] if int(card) >= 0]
+        return self._choose_card_from_state(
+            [(0, card_id) for card_id in current_trick],
+            int(observation["lead_suit"]),
+            int(observation["trump_suit"]),
+            legal_actions,
+            aggressive=aggressive,
+        )
+
+    def _choose_bid_from_cards(
+        self,
+        visible_cards: Sequence[int],
+        trump_suit: int,
+        hand_size: int,
+        legal_actions: List[int],
+    ) -> int:
         strength = 0.0
         for card_id in visible_cards:
             if rank(card_id) >= 10:
@@ -56,35 +108,37 @@ class SafeHeuristicAgent:
                 strength += 0.4
             if trump_suit >= 0 and suit(card_id) == trump_suit:
                 strength += 0.35
-        target = int(round(min(int(observation["hand_size"]), max(0.0, strength))))
+        target = int(round(min(hand_size, max(0.0, strength))))
         if target in legal_actions:
             return target
         return min(legal_actions, key=lambda action: abs(action - target))
 
-    def _choose_card(
+    def _choose_card_from_state(
         self,
-        observation: Dict[str, np.ndarray],
+        current_trick: Sequence[tuple[int, int]],
+        lead_suit: int | None,
+        trump_suit: int | None,
         legal_actions: List[int],
+        *,
         aggressive: bool,
     ) -> int:
         legal_cards = [action - CARD_ACTION_OFFSET for action in legal_actions if action >= CARD_ACTION_OFFSET]
         if not legal_cards:
             return self.rng.choice(legal_actions)
-        lead_suit = int(observation["lead_suit"])
-        trump_suit = int(observation["trump_suit"])
-        current_trick_cards = [int(card) for card in observation["current_trick_cards"] if int(card) >= 0]
-        if not current_trick_cards:
+        if not current_trick:
             key = max if aggressive else min
             chosen = key(legal_cards, key=lambda card_id: (rank(card_id), suit(card_id)))
             return CARD_ACTION_OFFSET + chosen
 
-        winning_card = current_trick_cards[0]
-        for card_id in current_trick_cards[1:]:
-            if self._card_beats(card_id, winning_card, lead_suit, trump_suit):
+        winning_card = current_trick[0][1]
+        resolved_lead_suit = suit(winning_card) if lead_suit is None or lead_suit < 0 else lead_suit
+        resolved_trump_suit = -1 if trump_suit is None else trump_suit
+        for _, card_id in current_trick[1:]:
+            if self._card_beats(card_id, winning_card, resolved_lead_suit, resolved_trump_suit):
                 winning_card = card_id
 
         winning_options = [
-            card_id for card_id in legal_cards if self._card_beats(card_id, winning_card, lead_suit, trump_suit)
+            card_id for card_id in legal_cards if self._card_beats(card_id, winning_card, resolved_lead_suit, resolved_trump_suit)
         ]
         if winning_options:
             chosen = min(winning_options, key=lambda card_id: (rank(card_id), suit(card_id)))
@@ -118,8 +172,20 @@ class BidPlayHeuristicAgent(SafeHeuristicAgent):
         return self._choose_card(observation, legal_actions, aggressive=True)
 
     def _aggressive_bid(self, observation: Dict[str, np.ndarray], legal_actions: List[int]) -> int:
-        visible_cards = card_ids_from_mask(observation["hand_mask"])
-        trump_suit = int(observation["trump_suit"])
+        return self._aggressive_bid_from_cards(
+            card_ids_from_mask(observation["hand_mask"]),
+            int(observation["trump_suit"]),
+            int(observation["hand_size"]),
+            legal_actions,
+        )
+
+    def _aggressive_bid_from_cards(
+        self,
+        visible_cards: Sequence[int],
+        trump_suit: int,
+        hand_size: int,
+        legal_actions: List[int],
+    ) -> int:
         target = 0
         for card_id in visible_cards:
             if rank(card_id) >= 10:
@@ -128,7 +194,21 @@ class BidPlayHeuristicAgent(SafeHeuristicAgent):
                 target += 0.5
             if trump_suit >= 0 and suit(card_id) == trump_suit:
                 target += 0.5
-        target = int(round(min(int(observation["hand_size"]), target)))
+        target = int(round(min(hand_size, target)))
         if target in legal_actions:
             return target
         return max([action for action in legal_actions if action <= target] or [min(legal_actions)])
+
+    def select_action_from_game(self, game: RomanianWhistGame, player: int) -> int:
+        state = game.round_state
+        if state is None:
+            raise RuntimeError("Game has not been reset.")
+        legal_actions = game.legal_actions(player)
+        if state.phase == "bidding":
+            return self._aggressive_bid_from_cards(
+                game.visible_hand_for_player(player),
+                state.trump_suit if state.trump_suit is not None else -1,
+                state.hand_size,
+                legal_actions,
+            )
+        return self._choose_card_from_state(state.current_trick, state.lead_suit, state.trump_suit, legal_actions, aggressive=True)

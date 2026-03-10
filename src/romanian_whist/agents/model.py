@@ -455,7 +455,8 @@ class PolicyAgent:
         return self.recommend(observation).chosen_action
 
     def recommend(self, observation: Mapping[str, object], top_k: int = 5) -> ActionRecommendation:
-        self.policy.eval()
+        if self.policy.training:
+            self.policy.eval()
         with torch.no_grad():
             batch = batch_observations([observation], device=self._policy_device())
             outputs = self.policy.forward_with_aux(batch)

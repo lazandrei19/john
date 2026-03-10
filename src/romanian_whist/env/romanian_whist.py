@@ -22,6 +22,7 @@ class RomanianWhistEnv:
     def __init__(self, config: Optional[WhistVariantConfig] = None):
         self.config = config or WhistVariantConfig()
         self.possible_agents = ["player_{index}".format(index=index) for index in range(self.config.players)]
+        self.agent_to_index = {agent: index for index, agent in enumerate(self.possible_agents)}
         self.agents = list(self.possible_agents)
         self.game = RomanianWhistGame(self.config)
         self.rewards = dict((agent, 0.0) for agent in self.possible_agents)
@@ -45,14 +46,20 @@ class RomanianWhistEnv:
     def observe(self, agent: str) -> Dict[str, object]:
         return self.game.observe(self.agent_index(agent))
 
-    def agent_index(self, agent: str) -> int:
-        return self.possible_agents.index(agent)
+    def observe_for_baseline(self, agent: str) -> Dict[str, object]:
+        return self.game.observe_for_baseline(self.agent_index(agent))
 
-    def step(self, action: int) -> EnvTransition:
-        actor = self.agent_selection
+    def agent_index(self, agent: str) -> int:
+        return self.agent_to_index[agent]
+
+    def step_outcome(self, action: int) -> StepOutcome:
         outcome = self.game.step(action)
         self._update_from_outcome(outcome)
-        observation = self.observe(self.agent_selection) if not outcome.match_finished else {}
+        return outcome
+
+    def step(self, action: int, *, include_observation: bool = True) -> EnvTransition:
+        outcome = self.step_outcome(action)
+        observation = self.observe(self.agent_selection) if include_observation and not outcome.match_finished else {}
         return EnvTransition(
             observation=observation,
             rewards=dict(self.rewards),
