@@ -526,12 +526,210 @@ class LeagueTrainer:
                 self.writer.close()
         return history
 
+    def _collect_rollouts_gpu_batched(
+        self,
+        player_counts: tuple[int, ...],
+        one_card_modes: tuple[object, ...],
+        episodes: int,
+    ) -> RolloutBuffer:
+        start_time = time.perf_counter()
+        buffer = RolloutBuffer()
+        device = torch.device(self.league_config.device)
+        player_count_schedule = self._player_count_schedule(player_counts, episodes)
+
+        gpu_snapshots = []
+        for snapshot in self.snapshots:
+            gpu_snap = copy.deepcopy(snapshot).to(device)
+            gpu_snap.eval()
+            gpu_snapshots.append(gpu_snap)
+        self.policy.eval()
+
+        episode_states = []
+        for episode_index, players in enumerate(player_count_schedule):
+            config = self.variant_config.replace(players=players, one_card_modes=tuple(one_card_modes))
+            env = RomanianWhistEnv(config)
+            env.reset(seed=self.rng.randint(0, 1_000_000))
+            focal_seat = episode_index % players
+            focal_agent_name = env.possible_agents[focal_seat]
+            opponent_specs = self._sample_opponent_specs(players, focal_seat)
+            scripted_agents = {}
+            for seat, spec in enumerate(opponent_specs):
+                if spec["role"] not in ("focal", "latest", "snapshot"):
+                    scripted_agents[seat] = _baseline_agent(spec["role"], int(spec["seed"]))
+            episode_states.append(
+                {
+                    "env": env,
+                    "focal_seat": focal_seat,
+                    "focal_agent_name": focal_agent_name,
+                    "opponent_specs": opponent_specs,
+                    "scripted_agents": scripted_agents,
+                    "last_transition_index": None,
+                    "trajectory_id": episode_index,
+                }
+            )
+
+        while True:
+            active_states = [state for state in episode_states if not all(state["env"].terminations.values())]
+            if not active_states:
+                break
+            focal_items = []  # type: List[Dict[str, object]]
+            policy_batches = {}  # type: Dict[tuple[str, int], List[Dict[str, object]]]
+            progress_made = False
+
+            for state in active_states:
+                env = state["env"]
+                acting_agent = env.agent_selection
+                seat = env.agent_index(acting_agent)
+                observation = env.observe(acting_agent)
+
+                if seat == state["focal_seat"]:
+                    training_obs = _training_observation(env, seat, observation)
+                    focal_items.append(
+                        {
+                            "state": state,
+                            "observation": training_obs,
+                        }
+                    )
+                    continue
+
+                spec = state["opponent_specs"][seat]
+                role = spec["role"]
+
+                if role in ("random", "safe", "heuristic"):
+                    agent = state["scripted_agents"][seat]
+                    before_potential = _round_potential(env, state["focal_seat"])
+                    action = agent.select_action(observation)
+                    transition = env.step(action)
+                    after_potential = (
+                        0.0
+                        if transition.terminations[state["focal_agent_name"]]
+                        else _round_potential(env, state["focal_seat"])
+                    )
+                    shaped_reward = transition.rewards[state["focal_agent_name"]] + (
+                        self.league_config.reward_shaping_coef * (after_potential - before_potential)
+                    )
+                    if state["last_transition_index"] is not None:
+                        buffer.rewards[state["last_transition_index"]] += shaped_reward
+                        buffer.dones[state["last_transition_index"]] = transition.terminations[state["focal_agent_name"]]
+                    progress_made = True
+                    continue
+
+                if role == "latest":
+                    policy_batches.setdefault(("latest", -1), []).append(
+                        {
+                            "state": state,
+                            "observation": observation,
+                            "greedy": bool(spec.get("greedy", True)),
+                        }
+                    )
+                elif role == "snapshot":
+                    snapshot_index = int(spec["snapshot_index"])
+                    policy_batches.setdefault(("snapshot", snapshot_index), []).append(
+                        {
+                            "state": state,
+                            "observation": observation,
+                            "greedy": bool(spec.get("greedy", True)),
+                        }
+                    )
+
+            if focal_items:
+                with torch.no_grad():
+                    batch = batch_observations(
+                        [item["observation"] for item in focal_items],
+                        device=device,
+                    )
+                    logits, values_t = self.policy(batch)
+                    filtered = masked_logits(logits, batch["legal_action_mask"])
+                    dist = torch.distributions.Categorical(logits=filtered)
+                    actions_t = dist.sample()
+                    log_probs_t = dist.log_prob(actions_t)
+                actions_list = actions_t.cpu().tolist()
+                log_probs_list = log_probs_t.cpu().tolist()
+                values_list = values_t.cpu().tolist()
+                for item, action, log_prob, value in zip(focal_items, actions_list, log_probs_list, values_list):
+                    state = item["state"]
+                    if state["last_transition_index"] is not None:
+                        buffer.next_values[state["last_transition_index"]] = value
+                    before_potential = _round_potential(state["env"], state["focal_seat"])
+                    transition = state["env"].step(action)
+                    after_potential = (
+                        0.0
+                        if transition.terminations[state["focal_agent_name"]]
+                        else _round_potential(state["env"], state["focal_seat"])
+                    )
+                    shaped_reward = transition.rewards[state["focal_agent_name"]] + (
+                        self.league_config.reward_shaping_coef * (after_potential - before_potential)
+                    )
+                    buffer.add(
+                        observation=item["observation"],
+                        action=action,
+                        log_prob=log_prob,
+                        value=value,
+                        reward=shaped_reward,
+                        done=transition.terminations[state["focal_agent_name"]],
+                        trajectory_id=state["trajectory_id"],
+                    )
+                    state["last_transition_index"] = len(buffer) - 1
+                progress_made = True
+
+            for (kind, index), items in policy_batches.items():
+                policy = self.policy if kind == "latest" else gpu_snapshots[index]
+                with torch.no_grad():
+                    batch = batch_observations(
+                        [item["observation"] for item in items],
+                        device=device,
+                    )
+                    logits, values_t = policy(batch)
+                    filtered = masked_logits(logits, batch["legal_action_mask"])
+                    dist = torch.distributions.Categorical(logits=filtered)
+                    sampled = dist.sample()
+                    greedy = torch.argmax(filtered, dim=-1)
+                    greedy_flags = torch.as_tensor(
+                        [item["greedy"] for item in items],
+                        dtype=torch.bool,
+                        device=device,
+                    )
+                    actions_t = torch.where(greedy_flags, greedy, sampled)
+                actions_list = actions_t.cpu().tolist()
+                for item, action in zip(items, actions_list):
+                    state = item["state"]
+                    before_potential = _round_potential(state["env"], state["focal_seat"])
+                    transition = state["env"].step(action)
+                    after_potential = (
+                        0.0
+                        if transition.terminations[state["focal_agent_name"]]
+                        else _round_potential(state["env"], state["focal_seat"])
+                    )
+                    shaped_reward = transition.rewards[state["focal_agent_name"]] + (
+                        self.league_config.reward_shaping_coef * (after_potential - before_potential)
+                    )
+                    if state["last_transition_index"] is not None:
+                        buffer.rewards[state["last_transition_index"]] += shaped_reward
+                        buffer.dones[state["last_transition_index"]] = transition.terminations[state["focal_agent_name"]]
+                progress_made = True
+
+            if not progress_made:
+                raise RuntimeError("GPU batched rollout made no progress while active environments remain.")
+
+        del gpu_snapshots
+        elapsed = time.perf_counter() - start_time
+        self.last_rollout_stats = {
+            "rollout/episodes": float(episodes),
+            "rollout/workers_used": 1.0,
+            "rollout/gpu_batched": 1.0,
+            "rollout/worker_task_sec_mean": elapsed,
+            "rollout/worker_task_sec_max": elapsed,
+        }
+        return buffer
+
     def collect_rollouts(
         self,
         player_counts: tuple[int, ...],
         one_card_modes: tuple[object, ...],
         episodes: int,
     ) -> RolloutBuffer:
+        if self.league_config.device.startswith("cuda"):
+            return self._collect_rollouts_gpu_batched(player_counts, one_card_modes, episodes)
         if self.league_config.rollout_workers > 1:
             return self._collect_rollouts_parallel(player_counts, one_card_modes, episodes)
         start_time = time.perf_counter()
