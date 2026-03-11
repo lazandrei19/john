@@ -46,12 +46,20 @@ class LeagueConfig:
     rollout_player_counts: Optional[tuple[int, ...]] = None
     rollout_one_card_modes: Optional[tuple[OneCardMode, ...]] = None
     reward_shaping_coef: float = 0.5
+    final_reward_shaping_coef: Optional[float] = None
     imitation_episodes: int = 0
     rollout_workers: int = 1
     eval_workers: int = 1
     save_best_checkpoint: bool = True
     max_active_snapshots: int = 3
     tensorboard_log_dir: Optional[Path] = None
+
+    def __post_init__(self) -> None:
+        weights = (self.latest_weight, self.snapshot_weight, self.scripted_weight)
+        if any(weight < 0.0 for weight in weights):
+            raise ValueError("Opponent mix weights must be non-negative.")
+        if sum(weights) <= 0.0:
+            raise ValueError("At least one opponent mix weight must be positive.")
 
 
 def _policy_state_cpu(policy: WhistPolicyNetwork) -> Dict[str, object]:
@@ -765,7 +773,14 @@ class LeagueTrainer:
     def __post_init__(self) -> None:
         self.rng = random.Random(self.league_config.seed)
         self.policy = WhistPolicyNetwork.from_config(self.policy_config)
-        self.ppo = PPOTrainer(self.policy, self.ppo_config, device=self.league_config.device)
+        self.ppo = PPOTrainer(self.policy, self.ppo_config, device=self.league_config.device, total_updates=self.league_config.total_updates)
+        self.initial_reward_shaping_coef = self.league_config.reward_shaping_coef
+        self.final_reward_shaping_coef = (
+            self.league_config.final_reward_shaping_coef
+            if self.league_config.final_reward_shaping_coef is not None
+            else self.league_config.reward_shaping_coef
+        )
+        self.current_reward_shaping_coef = self.league_config.reward_shaping_coef
         self.curriculum = CurriculumScheduler(self.league_config.total_updates)
         self.snapshots = []  # type: List[WhistPolicyNetwork]
         self.best_snapshot = None  # type: Optional[WhistPolicyNetwork]
@@ -804,6 +819,11 @@ class LeagueTrainer:
                     self.writer.flush()
             for local_update_index in range(total_updates):
                 update_index = start_update + local_update_index + 1
+                anneal_progress = self._anneal_progress(update_index, start_update, total_updates)
+                self.ppo.set_anneal_progress(anneal_progress)
+                self.current_reward_shaping_coef = self.initial_reward_shaping_coef + (
+                    (self.final_reward_shaping_coef - self.initial_reward_shaping_coef) * anneal_progress
+                )
                 stage = self.curriculum.stage_for_update(update_index - 1)
                 rollout_player_counts = self._rollout_player_counts(stage.player_counts)
                 rollout_one_card_modes = self._rollout_one_card_modes(stage.one_card_modes)
@@ -827,6 +847,8 @@ class LeagueTrainer:
                 metrics["timing/transitions_per_sec"] = (
                     float(len(buffer)) / rollout_time if rollout_time > 0.0 else 0.0
                 )
+                metrics["entropy_coef"] = self.ppo.entropy_coef
+                metrics["reward_shaping_coef"] = self.current_reward_shaping_coef
                 metrics.update(self.last_rollout_stats)
                 evaluation = None
                 should_evaluate = (
@@ -921,7 +943,7 @@ class LeagueTrainer:
                 "episodes": chunk,
                 "latest_policy_state": latest_policy_state,
                 "snapshot_policy_states": [],
-                "reward_shaping_coef": self.league_config.reward_shaping_coef,
+                "reward_shaping_coef": self.current_reward_shaping_coef,
             }
             for chunk in _chunk_items(task_episodes, worker_count)
         ]
@@ -986,7 +1008,7 @@ class LeagueTrainer:
                     outcome = env.step_outcome(action)
                     after_potential = 0.0 if outcome.match_finished else _round_potential(env, focal_seat)
                     reward = outcome.rewards[focal_seat] + (
-                        self.league_config.reward_shaping_coef * (after_potential - before_potential)
+                        self.current_reward_shaping_coef * (after_potential - before_potential)
                     )
                     done = outcome.match_finished
                     last_transition_index = buffer.add(
@@ -1004,7 +1026,7 @@ class LeagueTrainer:
                     outcome = env.step_outcome(action)
                     after_potential = 0.0 if outcome.match_finished else _round_potential(env, focal_seat)
                     shaped_reward = outcome.rewards[focal_seat] + (
-                        self.league_config.reward_shaping_coef * (after_potential - before_potential)
+                        self.current_reward_shaping_coef * (after_potential - before_potential)
                     )
                     if last_transition_index is not None:
                         buffer.rewards[last_transition_index] += shaped_reward
@@ -1074,7 +1096,7 @@ class LeagueTrainer:
                     "episodes": chunk,
                     "latest_policy_state": latest_policy_state,
                     "snapshot_policy_states": snapshot_policy_states,
-                    "reward_shaping_coef": self.league_config.reward_shaping_coef,
+                    "reward_shaping_coef": self.current_reward_shaping_coef,
                 }
                 for chunk in _chunk_items(task_episodes, worker_count)
         ]
@@ -1126,6 +1148,13 @@ class LeagueTrainer:
                 actions.append(teacher_action)
                 env.step(teacher_action, include_observation=False)
         return self.ppo.imitation_update(observations, actions)
+
+    @staticmethod
+    def _anneal_progress(update_index: int, start_update: int, total_updates: int) -> float:
+        total_run_updates = start_update + total_updates
+        if total_run_updates <= 1:
+            return 0.0
+        return min(1.0, max(0.0, float(update_index - 1) / float(total_run_updates - 1)))
 
     def _evaluate_parallel(self, matches: int = 8) -> Dict[str, object]:
         per_player_count = {}  # type: Dict[str, Dict[str, Dict[str, float]]]
@@ -1240,11 +1269,11 @@ class LeagueTrainer:
             if seat == focal_seat:
                 pool.append(PolicyAgent(self.policy, device=self.league_config.device, greedy=False))
                 continue
-            roll = self.rng.random()
-            if available_indices and roll < self.league_config.snapshot_weight:
+            opponent_role = self._sample_opponent_role(bool(available_indices))
+            if opponent_role == "snapshot":
                 snapshot = all_snapshots[self.rng.choice(available_indices)]
                 pool.append(PolicyAgent(snapshot, device=self.league_config.device, greedy=True))
-            elif roll < self.league_config.snapshot_weight + self.league_config.scripted_weight:
+            elif opponent_role == "scripted":
                 pool.append(copy.deepcopy(self.rng.choice(self.scripted_pool)))
             else:
                 pool.append(PolicyAgent(self.policy, device=self.league_config.device, greedy=True))
@@ -1267,19 +1296,32 @@ class LeagueTrainer:
             if seat == focal_seat:
                 specs.append({"role": "focal"})
                 continue
-            roll = self.rng.random()
             available_snapshots = active_snapshot_indices if active_snapshot_indices is not None else (
                 list(range(len(self._all_snapshots))) if self._all_snapshots else []
             )
-            if available_snapshots and roll < self.league_config.snapshot_weight:
+            opponent_role = self._sample_opponent_role(bool(available_snapshots))
+            if opponent_role == "snapshot":
                 snapshot_index = self.rng.choice(available_snapshots)
                 specs.append({"role": "snapshot", "snapshot_index": snapshot_index, "greedy": True})
-            elif roll < self.league_config.snapshot_weight + self.league_config.scripted_weight:
+            elif opponent_role == "scripted":
                 baseline_role = self.rng.choice(("random", "safe", "heuristic"))
                 specs.append({"role": baseline_role, "seed": self.rng.randint(0, 1_000_000)})
             else:
                 specs.append({"role": "latest", "greedy": True})
         return specs
+
+    def _sample_opponent_role(self, snapshots_available: bool) -> str:
+        choices = [("latest", self.league_config.latest_weight), ("scripted", self.league_config.scripted_weight)]
+        if snapshots_available:
+            choices.append(("snapshot", self.league_config.snapshot_weight))
+        total_weight = sum(weight for _, weight in choices)
+        roll = self.rng.random() * total_weight
+        cumulative = 0.0
+        for role, weight in choices:
+            cumulative += weight
+            if roll <= cumulative:
+                return role
+        return choices[-1][0]
 
     def _promote_snapshot(self) -> None:
         snapshot = copy.deepcopy(self.policy).cpu()
@@ -1296,6 +1338,7 @@ class LeagueTrainer:
             path,
             self.policy,
             optimizer=self.ppo.optimizer,
+            scheduler=self.ppo.scheduler,
             metadata={"metrics": metrics, "evaluation": evaluation, "update": update_index},
         )
         if evaluation is not None:
@@ -1316,6 +1359,7 @@ class LeagueTrainer:
             path,
             self.policy,
             optimizer=self.ppo.optimizer,
+            scheduler=self.ppo.scheduler,
             metadata={"metrics": metrics, "evaluation": evaluation, "update": update_index, "best": True},
         )
         report_path = self.league_config.checkpoint_dir / "best.eval.json"
@@ -1331,6 +1375,8 @@ class LeagueTrainer:
                 self.writer.add_text("train/stage_name", str(value), global_step=update_index)
                 continue
             self.writer.add_scalar("train/{key}".format(key=key), float(value), update_index)
+        current_lr = self.ppo.optimizer.param_groups[0]["lr"]
+        self.writer.add_scalar("train/learning_rate", current_lr, update_index)
         if evaluation is not None:
             for tag, value in self._flatten_scalars(evaluation):
                 self.writer.add_scalar(tag, value, update_index)

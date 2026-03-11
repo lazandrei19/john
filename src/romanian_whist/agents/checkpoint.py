@@ -13,6 +13,7 @@ def save_checkpoint(
     path: Path,
     model: WhistPolicyNetwork,
     optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[Any] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     payload = {
@@ -22,6 +23,8 @@ def save_checkpoint(
     }
     if optimizer is not None:
         payload["optimizer_state"] = optimizer.state_dict()
+    if scheduler is not None:
+        payload["scheduler_state"] = scheduler.state_dict()
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
 

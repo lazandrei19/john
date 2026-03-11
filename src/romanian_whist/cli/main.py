@@ -103,8 +103,13 @@ def train(
     evaluation_matches: int = typer.Option(4, "--evaluation-matches"),
     evaluation_every: int = typer.Option(1, "--evaluation-every"),
     entropy_coef: float = typer.Option(0.01, "--entropy-coef"),
+    final_entropy_coef: Optional[float] = typer.Option(None, "--final-entropy-coef"),
     gae_lambda: float = typer.Option(0.95, "--gae-lambda"),
     reward_shaping: float = typer.Option(0.5, "--reward-shaping"),
+    final_reward_shaping: Optional[float] = typer.Option(None, "--final-reward-shaping"),
+    latest_weight: float = typer.Option(0.5, "--latest-weight"),
+    snapshot_weight: float = typer.Option(0.35, "--snapshot-weight"),
+    scripted_weight: float = typer.Option(0.15, "--scripted-weight"),
     imitation_episodes: int = typer.Option(0, "--imitation-episodes"),
     rollout_workers: int = typer.Option(1, "--rollout-workers"),
     eval_workers: int = typer.Option(1, "--eval-workers"),
@@ -119,7 +124,13 @@ def train(
     policy_config = PolicyNetworkConfig(embed_dim=embed_dim)
     trainer = LeagueTrainer(
         variant_config=_config(players, seed, one_card_modes),
-        ppo_config=PPOConfig(learning_rate=learning_rate, entropy_coef=entropy_coef, gae_lambda=gae_lambda, batch_size=batch_size),
+        ppo_config=PPOConfig(
+            learning_rate=learning_rate,
+            entropy_coef=entropy_coef,
+            final_entropy_coef=final_entropy_coef,
+            gae_lambda=gae_lambda,
+            batch_size=batch_size,
+        ),
         policy_config=policy_config,
         league_config=LeagueConfig(
             total_updates=updates,
@@ -132,6 +143,10 @@ def train(
             evaluation_player_counts=evaluation_player_counts,
             rollout_player_counts=rollout_player_counts,
             reward_shaping_coef=reward_shaping,
+            final_reward_shaping_coef=final_reward_shaping,
+            latest_weight=latest_weight,
+            snapshot_weight=snapshot_weight,
+            scripted_weight=scripted_weight,
             imitation_episodes=imitation_episodes,
             rollout_workers=rollout_workers,
             eval_workers=eval_workers,
@@ -153,6 +168,9 @@ def train(
         optimizer_state = payload.get("optimizer_state")
         if optimizer_state is not None:
             trainer.ppo.optimizer.load_state_dict(optimizer_state)
+        scheduler_state = payload.get("scheduler_state")
+        if scheduler_state is not None and trainer.ppo.scheduler is not None:
+            trainer.ppo.scheduler.load_state_dict(scheduler_state)
         metadata = payload.get("metadata", {})
         start_update = int(metadata.get("update", 0))
         best_eval_path = output / "best.eval.json"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping
+from typing import Dict, List, Mapping, Optional
 
 import numpy as np
 import torch
@@ -17,6 +17,7 @@ class PPOConfig:
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
     entropy_coef: float = 0.01
+    final_entropy_coef: Optional[float] = None
     value_coef: float = 0.5
     belief_loss_coef: float = 0.2
     learning_rate: float = 3e-4
@@ -64,16 +65,31 @@ class RolloutBuffer:
 
 
 class PPOTrainer:
-    def __init__(self, policy: WhistPolicyNetwork, config: PPOConfig, device: str = "cpu"):
+    def __init__(self, policy: WhistPolicyNetwork, config: PPOConfig, device: str = "cpu", total_updates: int = 0):
         self.policy = policy.to(device)
         self.config = config
         self.device = device
+        self.initial_entropy_coef = config.entropy_coef
+        self.final_entropy_coef = config.final_entropy_coef if config.final_entropy_coef is not None else config.entropy_coef
+        self.entropy_coef = config.entropy_coef
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=config.learning_rate)
+        if total_updates > 0:
+            self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer, start_factor=1.0, end_factor=0.1, total_iters=total_updates,
+            )
+        else:
+            self.scheduler = None
         scaler_enabled = config.mixed_precision and device.startswith("cuda")
         if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
             self.scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
         else:
             self.scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
+
+    def set_anneal_progress(self, progress: float) -> None:
+        clamped_progress = min(1.0, max(0.0, float(progress)))
+        self.entropy_coef = self.initial_entropy_coef + (
+            (self.final_entropy_coef - self.initial_entropy_coef) * clamped_progress
+        )
 
     def select_action(self, observation: Mapping[str, object]) -> tuple[int, float, float]:
         if self.policy.training:
@@ -131,7 +147,7 @@ class PPOTrainer:
                         policy_loss
                         + (self.config.value_coef * value_loss)
                         + (self.config.belief_loss_coef * belief_loss)
-                        - (self.config.entropy_coef * entropy)
+                        - (self.entropy_coef * entropy)
                     )
 
                 self.optimizer.zero_grad(set_to_none=True)
@@ -148,6 +164,8 @@ class PPOTrainer:
                 metrics["belief_loss"] += float(belief_loss.item())
 
         divisor = float(max(1, self.config.epochs * max(1, int(np.ceil(len(indices) / self.config.batch_size)))))
+        if self.scheduler is not None:
+            self.scheduler.step()
         return dict((key, value / divisor) for key, value in metrics.items())
 
     def imitation_update(self, observations: List[Mapping[str, object]], actions: List[int]) -> Dict[str, float]:
