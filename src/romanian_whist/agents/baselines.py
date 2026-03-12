@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -21,6 +21,10 @@ def card_ids_from_mask(mask: Sequence[int]) -> List[int]:
     if isinstance(mask, np.ndarray):
         return np.flatnonzero(mask).tolist()
     return [index for index, enabled in enumerate(mask) if enabled]
+
+
+def _normalized_trump_suit(trump_suit: Optional[int]) -> int:
+    return -1 if trump_suit is None else int(trump_suit)
 
 
 @dataclass
@@ -96,17 +100,18 @@ class SafeHeuristicAgent:
     def _choose_bid_from_cards(
         self,
         visible_cards: Sequence[int],
-        trump_suit: int,
+        trump_suit: int | None,
         hand_size: int,
         legal_actions: List[int],
     ) -> int:
+        resolved_trump_suit = _normalized_trump_suit(trump_suit)
         strength = 0.0
         for card_id in visible_cards:
             if rank(card_id) >= 10:
                 strength += 0.7
             elif rank(card_id) >= 8:
                 strength += 0.4
-            if trump_suit >= 0 and suit(card_id) == trump_suit:
+            if resolved_trump_suit >= 0 and suit(card_id) == resolved_trump_suit:
                 strength += 0.35
         target = int(round(min(hand_size, max(0.0, strength))))
         if target in legal_actions:
@@ -182,17 +187,18 @@ class BidPlayHeuristicAgent(SafeHeuristicAgent):
     def _aggressive_bid_from_cards(
         self,
         visible_cards: Sequence[int],
-        trump_suit: int,
+        trump_suit: int | None,
         hand_size: int,
         legal_actions: List[int],
     ) -> int:
+        resolved_trump_suit = _normalized_trump_suit(trump_suit)
         target = 0
         for card_id in visible_cards:
             if rank(card_id) >= 10:
                 target += 1
             elif rank(card_id) >= 8:
                 target += 0.5
-            if trump_suit >= 0 and suit(card_id) == trump_suit:
+            if resolved_trump_suit >= 0 and suit(card_id) == resolved_trump_suit:
                 target += 0.5
         target = int(round(min(hand_size, target)))
         if target in legal_actions:
@@ -207,7 +213,7 @@ class BidPlayHeuristicAgent(SafeHeuristicAgent):
         if state.phase == "bidding":
             return self._aggressive_bid_from_cards(
                 game.visible_hand_for_player(player),
-                state.trump_suit if state.trump_suit is not None else -1,
+                state.trump_suit,
                 state.hand_size,
                 legal_actions,
             )
