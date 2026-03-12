@@ -331,7 +331,7 @@ class RomanianWhistGame:
             mode = OneCardMode.REGULAR
 
         deck = shuffled_deck(self.rng)
-        active, remainder = active_deck(deck, self.config.players, self.config.max_hand_size)
+        active, _ = active_deck(deck, self.config.players, self.config.max_hand_size)
         hands = [[] for _ in range(self.config.players)]  # type: List[List[int]]
         deal_order = [((self.dealer + 1) + offset) % self.config.players for offset in range(self.config.players)]
         for card_index in range(hand_size):
@@ -340,7 +340,8 @@ class RomanianWhistGame:
                 hands[player].append(active[deck_offset])
         hands = [sorted_hand(hand) for hand in hands]
 
-        trump_card = remainder[0] if remainder else None
+        dealt_count = hand_size * self.config.players
+        trump_card = active[dealt_count] if dealt_count < len(active) else None
         trump_suit = suit(trump_card) if trump_card is not None else None
         leader = (self.dealer + 1) % self.config.players
         self.round_state = RoundState(

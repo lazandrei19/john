@@ -1,4 +1,4 @@
-from romanian_whist.rules.cards import card_label
+from romanian_whist.rules.cards import card_label, parse_card
 from romanian_whist.rules.config import OneCardMode, WhistVariantConfig
 from romanian_whist.rules.game import RomanianWhistGame, action_from_bid, action_from_card
 
@@ -93,3 +93,27 @@ def test_trick_winner_and_round_scoring() -> None:
     outcome = game.step(action_from_card(0))
     assert outcome.round_finished
     assert game.scores[0] == 6
+
+
+def test_max_hand_round_has_no_trump() -> None:
+    game = RomanianWhistGame(WhistVariantConfig(players=4, seed=7))
+    game.reset(seed=7)
+
+    assert game.round_state is not None
+    assert game.round_state.hand_size == 8
+    assert game.round_state.trump_card is None
+    assert game.round_state.trump_suit is None
+
+
+def test_max_hand_round_allows_any_card_when_void_in_lead_suit() -> None:
+    game = RomanianWhistGame(WhistVariantConfig(players=4, seed=7))
+    game.reset(seed=7)
+
+    assert game.round_state is not None
+    state = game.round_state
+    state.phase = "play"
+    state.current_trick = [(0, parse_card("2C"))]
+    state.hands[1] = [parse_card("3D"), parse_card("AH")]
+
+    legal = game.legal_actions(1)
+    assert legal == [action_from_card(parse_card("3D")), action_from_card(parse_card("AH"))]
