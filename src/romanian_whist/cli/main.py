@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +20,7 @@ from romanian_whist.web.app import run_ui
 
 app = typer.Typer(add_completion=False)
 VALID_SEAT_ROLES = {"human", "model", "heuristic", "safe", "random", "bot"}
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _config(players: int, seed: int, one_card_modes: str) -> WhistVariantConfig:
@@ -88,6 +90,137 @@ def _bot_agents_for_roles(roles: list[str], seed: int, checkpoint_agent: Optiona
     return agents
 
 
+def _load_checkpoint_or_bad_parameter(path: Path, device: str) -> tuple[object, dict]:
+    try:
+        return load_policy_checkpoint(path, device=device)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _train_command(
+    *,
+    output: Path,
+    updates: int,
+    episodes_per_update: int,
+    learning_rate: float,
+    embed_dim: int,
+    players: int,
+    seed: int,
+    device: str,
+    one_card_modes: str,
+    universal: bool,
+    evaluation_matches: int,
+    evaluation_every: int,
+    entropy_coef: float,
+    final_entropy_coef: Optional[float],
+    gae_lambda: float,
+    reward_shaping: float,
+    final_reward_shaping: Optional[float],
+    latest_weight: float,
+    snapshot_weight: float,
+    scripted_weight: float,
+    rollout_workers: int,
+    eval_workers: int,
+    batch_size: int,
+    tensorboard_logdir: Path,
+) -> list[str]:
+    command = [
+        "uv",
+        "run",
+        "romanian-whist",
+        "train",
+        "--output",
+        str(output),
+        "--updates",
+        str(updates),
+        "--episodes-per-update",
+        str(episodes_per_update),
+        "--learning-rate",
+        str(learning_rate),
+        "--embed-dim",
+        str(embed_dim),
+        "--players",
+        str(players),
+        "--seed",
+        str(seed),
+        "--device",
+        device,
+        "--one-card-modes",
+        one_card_modes,
+        "--evaluation-matches",
+        str(evaluation_matches),
+        "--evaluation-every",
+        str(evaluation_every),
+        "--entropy-coef",
+        str(entropy_coef),
+        "--gae-lambda",
+        str(gae_lambda),
+        "--reward-shaping",
+        str(reward_shaping),
+        "--latest-weight",
+        str(latest_weight),
+        "--snapshot-weight",
+        str(snapshot_weight),
+        "--scripted-weight",
+        str(scripted_weight),
+        "--rollout-workers",
+        str(rollout_workers),
+        "--eval-workers",
+        str(eval_workers),
+        "--batch-size",
+        str(batch_size),
+        "--tensorboard-logdir",
+        str(tensorboard_logdir),
+        "--universal" if universal else "--fixed-player-count",
+    ]
+    if final_entropy_coef is not None:
+        command.extend(["--final-entropy-coef", str(final_entropy_coef)])
+    if final_reward_shaping is not None:
+        command.extend(["--final-reward-shaping", str(final_reward_shaping)])
+    return command
+
+
+def _write_resume_script(output: Path, *, script_name: str, checkpoint_logic: str, command: list[str]) -> None:
+    script_path = output / script_name
+    quoted_command = " ".join(shlex.quote(part) for part in command)
+    script_path.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                "",
+                "cd {root}".format(root=shlex.quote(str(PROJECT_ROOT))),
+                "",
+                "OUTPUT={output}".format(output=shlex.quote(str(output))),
+                checkpoint_logic,
+                'if [[ -z "${CHECKPOINT:-}" || ! -f "$CHECKPOINT" ]]; then',
+                '  echo "Checkpoint not found: ${CHECKPOINT:-<empty>}" >&2',
+                "  exit 1",
+                "fi",
+                "",
+                'exec {command} --resume-from "$CHECKPOINT"'.format(command=quoted_command),
+                "",
+            ]
+        )
+    )
+    script_path.chmod(0o755)
+
+
+def _write_resume_scripts(output: Path, command: list[str]) -> None:
+    _write_resume_script(
+        output,
+        script_name="resume_latest.sh",
+        checkpoint_logic='CHECKPOINT="$(ls -1 "$OUTPUT"/update-*.pt 2>/dev/null | sort | tail -n 1)"',
+        command=command,
+    )
+    _write_resume_script(
+        output,
+        script_name="resume_best.sh",
+        checkpoint_logic='CHECKPOINT="$OUTPUT/best.pt"',
+        command=command,
+    )
+
+
 @app.command()
 def train(
     output: Path = typer.Option(Path("runs/universal"), "--output"),
@@ -110,7 +243,6 @@ def train(
     latest_weight: float = typer.Option(0.5, "--latest-weight"),
     snapshot_weight: float = typer.Option(0.35, "--snapshot-weight"),
     scripted_weight: float = typer.Option(0.15, "--scripted-weight"),
-    imitation_episodes: int = typer.Option(0, "--imitation-episodes"),
     rollout_workers: int = typer.Option(1, "--rollout-workers"),
     eval_workers: int = typer.Option(1, "--eval-workers"),
     batch_size: int = typer.Option(64, "--batch-size"),
@@ -121,6 +253,35 @@ def train(
     evaluation_player_counts = (3, 4, 5, 6) if universal else (players,)
     rollout_player_counts = None if universal else (players,)
     resolved_tensorboard_logdir = tensorboard_logdir or (output / "tensorboard")
+    _write_resume_scripts(
+        output,
+        _train_command(
+            output=output,
+            updates=updates,
+            episodes_per_update=episodes_per_update,
+            learning_rate=learning_rate,
+            embed_dim=embed_dim,
+            players=players,
+            seed=seed,
+            device=device,
+            one_card_modes=one_card_modes,
+            universal=universal,
+            evaluation_matches=evaluation_matches,
+            evaluation_every=evaluation_every,
+            entropy_coef=entropy_coef,
+            final_entropy_coef=final_entropy_coef,
+            gae_lambda=gae_lambda,
+            reward_shaping=reward_shaping,
+            final_reward_shaping=final_reward_shaping,
+            latest_weight=latest_weight,
+            snapshot_weight=snapshot_weight,
+            scripted_weight=scripted_weight,
+            rollout_workers=rollout_workers,
+            eval_workers=eval_workers,
+            batch_size=batch_size,
+            tensorboard_logdir=resolved_tensorboard_logdir,
+        ),
+    )
     policy_config = PolicyNetworkConfig(embed_dim=embed_dim)
     trainer = LeagueTrainer(
         variant_config=_config(players, seed, one_card_modes),
@@ -147,7 +308,6 @@ def train(
             latest_weight=latest_weight,
             snapshot_weight=snapshot_weight,
             scripted_weight=scripted_weight,
-            imitation_episodes=imitation_episodes,
             rollout_workers=rollout_workers,
             eval_workers=eval_workers,
             tensorboard_log_dir=resolved_tensorboard_logdir,
@@ -155,7 +315,7 @@ def train(
     )
     start_update = 0
     if resume_from is not None:
-        policy, payload = load_policy_checkpoint(resume_from, device=device)
+        policy, payload = _load_checkpoint_or_bad_parameter(resume_from, device=device)
         checkpoint_embed_dim = int(payload.get("model_config", {}).get("embed_dim", embed_dim))
         if checkpoint_embed_dim != embed_dim:
             raise typer.BadParameter(
@@ -180,7 +340,7 @@ def train(
         elif "evaluation" in metadata:
             trainer.best_selection_score = trainer.selection_score(metadata["evaluation"])
         if best_checkpoint_path.exists():
-            best_policy, _ = load_policy_checkpoint(best_checkpoint_path, device="cpu")
+            best_policy, _ = _load_checkpoint_or_bad_parameter(best_checkpoint_path, device="cpu")
             best_policy.eval()
             trainer.best_snapshot = best_policy
         typer.echo(
@@ -200,7 +360,7 @@ def eval(
     device: str = typer.Option("cpu", "--device"),
     universal: bool = typer.Option(True, "--universal/--single-player-count"),
 ) -> None:
-    policy, _ = load_policy_checkpoint(checkpoint, device=device)
+    policy, _ = _load_checkpoint_or_bad_parameter(checkpoint, device=device)
     evaluation_player_counts = (3, 4, 5, 6) if universal else (players,)
     trainer = LeagueTrainer(
         variant_config=WhistVariantConfig(players=players, seed=seed),
@@ -250,7 +410,7 @@ def spectate(
     env.reset(seed=seed)
     checkpoint_agent = None
     if checkpoint is not None:
-        policy, _ = load_policy_checkpoint(checkpoint, device=device)
+        policy, _ = _load_checkpoint_or_bad_parameter(checkpoint, device=device)
         checkpoint_agent = PolicyAgent(policy, device=device, greedy=True)
     roles = _seat_roles(
         players,
@@ -293,7 +453,7 @@ def play(
     env.reset(seed=seed)
     model_agent = None
     if checkpoint is not None:
-        policy, _ = load_policy_checkpoint(checkpoint, device=device)
+        policy, _ = _load_checkpoint_or_bad_parameter(checkpoint, device=device)
         model_agent = PolicyAgent(policy, device=device, greedy=True)
     roles = _seat_roles(
         players,

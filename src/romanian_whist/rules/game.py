@@ -91,7 +91,7 @@ class RomanianWhistGame:
         self.scores = [0 for _ in range(config.players)]
         self.round_index = -1
         self.one_card_round_index = 0
-        self.dealer = 0
+        self.dealer = config.players - 1
         self.round_state = None  # type: Optional[RoundState]
         self.match_finished = False
         self.history_tokens = deque(maxlen=config.max_history_tokens)  # type: Deque[int]
@@ -105,7 +105,7 @@ class RomanianWhistGame:
         self.scores = [0 for _ in range(self.config.players)]
         self.round_index = -1
         self.one_card_round_index = 0
-        self.dealer = 0
+        self.dealer = self.config.players - 1
         self.match_finished = False
         self.history_tokens.clear()
         self.replay = []

@@ -8,7 +8,7 @@ torch = pytest.importorskip("torch")
 
 from romanian_whist.agents.checkpoint import load_policy_checkpoint
 from romanian_whist.agents.baselines import BidPlayHeuristicAgent, RandomLegalAgent, SafeHeuristicAgent
-from romanian_whist.agents.model import PolicyAgent, PolicyNetworkConfig, WhistPolicyNetwork
+from romanian_whist.agents.model import PolicyAgent, PolicyForwardOutputs, PolicyNetworkConfig, WhistPolicyNetwork
 from romanian_whist.env.romanian_whist import RomanianWhistEnv
 from romanian_whist.mlx_support.converter import CheckpointConverter
 from romanian_whist.rules.config import WhistVariantConfig
@@ -43,6 +43,10 @@ def test_ppo_smoke_and_checkpoint_roundtrip(tmp_path: pathlib.Path) -> None:
     assert "timing/rollout_sec" in payload["metadata"]["metrics"]
     assert "timing/eval_sec" in payload["metadata"]["metrics"]
     assert "timing/update_sec" in history[-1]
+    assert "policy_bid/min" in history[-1]
+    assert "policy_bid/max" in history[-1]
+    assert "policy_bid/mae_vs_actual" in history[-1]
+    assert "policy_bid/strong_hand_underbid_rate" in history[-1]
     assert list(tensorboard_dir.glob("events.out.tfevents.*"))
     assert policy is not None
 
@@ -104,6 +108,21 @@ def test_resume_training_continues_checkpoint_numbering(tmp_path: pathlib.Path) 
     assert checkpoint.exists()
     _, resumed_payload = load_policy_checkpoint(checkpoint)
     assert resumed_payload["metadata"]["update"] == 2
+
+
+def test_old_checkpoint_format_is_rejected(tmp_path: pathlib.Path) -> None:
+    path = tmp_path / "old.pt"
+    torch.save(
+        {
+            "model_state": WhistPolicyNetwork().state_dict(),
+            "model_config": WhistPolicyNetwork().config_dict(),
+            "metadata": {},
+        },
+        path,
+    )
+
+    with pytest.raises(ValueError, match="checkpoint_version"):
+        load_policy_checkpoint(path)
 
 
 def test_sparse_evaluation_only_writes_reports_on_interval(tmp_path: pathlib.Path) -> None:
@@ -244,8 +263,35 @@ def test_league_evaluation_contains_expected_metrics() -> None:
     )
     stats = trainer.evaluate(matches=1)
     assert set(stats.keys()) == {"overall", "by_player_count"}
-    assert set(stats["overall"].keys()) == {"average_scores", "contract_hit_rate", "trick_differential", "elo_like"}
+    assert set(stats["overall"].keys()) == {
+        "average_scores",
+        "contract_hit_rate",
+        "trick_differential",
+        "elo_like",
+        "average_bid",
+        "min_bid",
+        "max_bid",
+        "bid_mae",
+        "underbid_rate",
+        "overbid_rate",
+        "strong_hand_underbid_rate",
+    }
     assert set(stats["by_player_count"].keys()) == {"3", "4", "5", "6"}
+
+
+def test_rollout_bid_metrics_include_hand_size_breakdown() -> None:
+    trainer = LeagueTrainer(
+        variant_config=WhistVariantConfig(players=4, seed=24),
+        ppo_config=PPOConfig(epochs=1, batch_size=8),
+        league_config=LeagueConfig(total_updates=1, episodes_per_update=1, seed=24),
+    )
+
+    buffer = trainer.collect_rollouts((4,), trainer.variant_config.one_card_modes, 1)
+
+    assert len(buffer) > 0
+    assert "policy_bid/count" in trainer.last_rollout_stats
+    assert "policy_bid/by_hand_size/1/mean" in trainer.last_rollout_stats
+    assert "policy_bid/by_hand_size/8/rate_1" in trainer.last_rollout_stats
 
 
 def test_balanced_player_count_schedule_covers_all_counts() -> None:
@@ -286,17 +332,6 @@ def test_fixed_player_count_training_constrains_rollout_counts() -> None:
     assert history
     assert captured == [((6,), trainer.curriculum.stage_for_update(0).one_card_modes, 1)]
 
-
-def test_imitation_pretraining_smoke() -> None:
-    trainer = LeagueTrainer(
-        variant_config=WhistVariantConfig(players=4, seed=8),
-        ppo_config=PPOConfig(epochs=1, batch_size=8, imitation_epochs=1, imitation_batch_size=16),
-        league_config=LeagueConfig(total_updates=1, episodes_per_update=1, seed=8, imitation_episodes=2),
-    )
-    metrics = trainer.pretrain_imitation(episodes=2)
-    assert set(metrics.keys()) == {"imitation/loss", "imitation/action_loss", "imitation/belief_loss"}
-
-
 def test_ppo_update_restores_train_mode_after_rollout_inference() -> None:
     env = RomanianWhistEnv(WhistVariantConfig(players=4, seed=15))
     observation = env.reset(seed=15)
@@ -317,6 +352,65 @@ def test_ppo_update_restores_train_mode_after_rollout_inference() -> None:
     trainer.update(buffer)
 
     assert trainer.policy.training
+
+
+def test_expected_trick_loss_only_uses_bidding_samples_and_masks_large_classes() -> None:
+    trainer = PPOTrainer(
+        WhistPolicyNetwork(),
+        PPOConfig(epochs=1, batch_size=1, mixed_precision=False),
+        device="cpu",
+    )
+    outputs = PolicyForwardOutputs(
+        logits=torch.zeros((2, 61), dtype=torch.float32),
+        values=torch.zeros(2, dtype=torch.float32),
+        belief_logits=torch.zeros((2, 52, trainer.policy.max_players + 2), dtype=torch.float32),
+        expected_trick_logits=torch.tensor(
+            [
+                [0.0, 0.0, 10.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0],
+                [50.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        ),
+    )
+    batch_obs = {
+        "expected_trick_target": torch.tensor([2, 8], dtype=torch.int64),
+        "phase": torch.tensor([0, 1], dtype=torch.int64),
+        "hand_size": torch.tensor([2, 8], dtype=torch.int64),
+    }
+
+    loss = trainer._expected_trick_loss(outputs, batch_obs)
+
+    assert float(loss.item()) < 1e-3
+
+
+def test_entropy_bonus_scales_bidding_and_play_differently() -> None:
+    trainer = PPOTrainer(
+        WhistPolicyNetwork(),
+        PPOConfig(epochs=1, batch_size=1, mixed_precision=False, entropy_coef=0.5, bid_entropy_scale=2.0, play_entropy_scale=1.0),
+        device="cpu",
+    )
+
+    bonus = trainer._entropy_bonus(
+        torch.tensor([1.0, 1.0], dtype=torch.float32),
+        {"phase": torch.tensor([0, 1], dtype=torch.int64)},
+    )
+
+    assert float(bonus.item()) == pytest.approx(0.75)
+
+
+def test_selection_score_penalizes_strong_hand_underbidding() -> None:
+    evaluation = {
+        "overall": {
+            "average_scores": {"policy": 1.5},
+            "contract_hit_rate": {"policy": 0.4},
+            "trick_differential": {"policy": -0.5},
+            "strong_hand_underbid_rate": {"policy": 0.2},
+        }
+    }
+
+    score = LeagueTrainer.selection_score(evaluation)
+
+    assert score == pytest.approx(1.5 + (20.0 * 0.4) + (2.0 * -0.5) - (5.0 * 0.2))
 
 
 def test_returns_and_advantages_use_explicit_next_values_for_interleaved_trajectories() -> None:

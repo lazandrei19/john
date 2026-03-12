@@ -18,13 +18,14 @@ class PPOConfig:
     clip_ratio: float = 0.2
     entropy_coef: float = 0.01
     final_entropy_coef: Optional[float] = None
+    bid_entropy_scale: float = 1.5
+    play_entropy_scale: float = 1.0
     value_coef: float = 0.5
     belief_loss_coef: float = 0.2
+    expected_trick_loss_coef: float = 0.15
     learning_rate: float = 3e-4
     batch_size: int = 64
     epochs: int = 4
-    imitation_batch_size: int = 128
-    imitation_epochs: int = 3
     max_grad_norm: float = 1.0
     mixed_precision: bool = True
 
@@ -105,7 +106,14 @@ class PPOTrainer:
 
     def update(self, buffer: RolloutBuffer) -> Dict[str, float]:
         if not buffer:
-            return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "belief_loss": 0.0}
+            return {
+                "loss": 0.0,
+                "policy_loss": 0.0,
+                "value_loss": 0.0,
+                "entropy": 0.0,
+                "belief_loss": 0.0,
+                "expected_trick_loss": 0.0,
+            }
 
         self.policy.train()
         returns, advantages = self._returns_and_advantages(buffer)
@@ -116,7 +124,14 @@ class PPOTrainer:
         advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
         advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std(unbiased=False).clamp_min(1e-6))
 
-        metrics = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "belief_loss": 0.0}
+        metrics = {
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "entropy": 0.0,
+            "belief_loss": 0.0,
+            "expected_trick_loss": 0.0,
+        }
         indices = np.arange(len(buffer))
         for _ in range(self.config.epochs):
             np.random.shuffle(indices)
@@ -135,7 +150,8 @@ class PPOTrainer:
                     filtered_logits = masked_logits(outputs.logits, batch_obs["legal_action_mask"])
                     distribution = torch.distributions.Categorical(logits=filtered_logits)
                     new_log_probs = distribution.log_prob(batch_actions)
-                    entropy = distribution.entropy().mean()
+                    entropy_values = distribution.entropy()
+                    entropy_bonus = self._entropy_bonus(entropy_values, batch_obs)
                     ratio = torch.exp(new_log_probs - batch_old_log_probs)
                     unclipped = ratio * batch_advantages
                     clipped = torch.clamp(ratio, 1.0 - self.config.clip_ratio, 1.0 + self.config.clip_ratio)
@@ -143,11 +159,13 @@ class PPOTrainer:
                     policy_loss = -torch.min(unclipped, clipped).mean()
                     value_loss = torch.nn.functional.mse_loss(outputs.values, batch_returns)
                     belief_loss = self._belief_loss(outputs, batch_obs)
+                    expected_trick_loss = self._expected_trick_loss(outputs, batch_obs)
                     loss = (
                         policy_loss
                         + (self.config.value_coef * value_loss)
                         + (self.config.belief_loss_coef * belief_loss)
-                        - (self.entropy_coef * entropy)
+                        + (self.config.expected_trick_loss_coef * expected_trick_loss)
+                        - entropy_bonus
                     )
 
                 self.optimizer.zero_grad(set_to_none=True)
@@ -160,51 +178,14 @@ class PPOTrainer:
                 metrics["loss"] += float(loss.item())
                 metrics["policy_loss"] += float(policy_loss.item())
                 metrics["value_loss"] += float(value_loss.item())
-                metrics["entropy"] += float(entropy.item())
+                metrics["entropy"] += float(entropy_values.mean().item())
                 metrics["belief_loss"] += float(belief_loss.item())
+                metrics["expected_trick_loss"] += float(expected_trick_loss.item())
 
         divisor = float(max(1, self.config.epochs * max(1, int(np.ceil(len(indices) / self.config.batch_size)))))
         if self.scheduler is not None:
             self.scheduler.step()
         return dict((key, value / divisor) for key, value in metrics.items())
-
-    def imitation_update(self, observations: List[Mapping[str, object]], actions: List[int]) -> Dict[str, float]:
-        if not observations:
-            return {"imitation/loss": 0.0, "imitation/action_loss": 0.0, "imitation/belief_loss": 0.0}
-
-        self.policy.train()
-        batched = batch_observations(observations, device=torch.device(self.device))
-        target_actions = torch.as_tensor(actions, dtype=torch.long, device=self.device)
-        metrics = {"imitation/loss": 0.0, "imitation/action_loss": 0.0, "imitation/belief_loss": 0.0}
-        indices = np.arange(len(observations))
-        for _ in range(self.config.imitation_epochs):
-            np.random.shuffle(indices)
-            for start in range(0, len(indices), self.config.imitation_batch_size):
-                batch_idx = indices[start : start + self.config.imitation_batch_size]
-                batch_obs = {key: value[batch_idx] for key, value in batched.items()}
-                batch_actions = target_actions[batch_idx]
-                autocast_enabled = self.config.mixed_precision and self.device.startswith("cuda")
-                autocast = torch.amp.autocast if hasattr(torch, "amp") and hasattr(torch.amp, "autocast") else torch.cuda.amp.autocast
-                with autocast("cuda", enabled=autocast_enabled) if autocast is torch.amp.autocast else autocast(enabled=autocast_enabled):
-                    outputs = self.policy.forward_with_aux(batch_obs)
-                    filtered_logits = masked_logits(outputs.logits, batch_obs["legal_action_mask"])
-                    action_loss = F.cross_entropy(filtered_logits, batch_actions)
-                    belief_loss = self._belief_loss(outputs, batch_obs)
-                    loss = action_loss + (self.config.belief_loss_coef * belief_loss)
-
-                self.optimizer.zero_grad(set_to_none=True)
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-
-                metrics["imitation/loss"] += float(loss.item())
-                metrics["imitation/action_loss"] += float(action_loss.item())
-                metrics["imitation/belief_loss"] += float(belief_loss.item())
-
-        divisor = float(max(1, self.config.imitation_epochs * max(1, int(np.ceil(len(indices) / self.config.imitation_batch_size)))))
-        return {key: value / divisor for key, value in metrics.items()}
 
     def _returns_and_advantages(self, buffer: RolloutBuffer) -> tuple[np.ndarray, np.ndarray]:
         rewards = np.asarray(buffer.rewards, dtype=np.float32)
@@ -239,3 +220,36 @@ class PPOTrainer:
             reduction="none",
         )
         return (losses * flat_mask).sum() / flat_mask.sum().clamp_min(1.0)
+
+    def _expected_trick_loss(self, outputs: PolicyForwardOutputs, batch_obs: Dict[str, Tensor]) -> Tensor:
+        targets = batch_obs.get("expected_trick_target")
+        phases = batch_obs.get("phase")
+        hand_sizes = batch_obs.get("hand_size")
+        if targets is None or phases is None or hand_sizes is None:
+            return torch.zeros((), device=outputs.logits.device, dtype=outputs.logits.dtype)
+        bidding_mask = phases.eq(0).float()
+        if float(bidding_mask.sum().item()) <= 0.0:
+            return torch.zeros((), device=outputs.logits.device, dtype=outputs.logits.dtype)
+        class_ids = torch.arange(outputs.expected_trick_logits.shape[-1], device=outputs.expected_trick_logits.device).unsqueeze(0)
+        valid_classes = class_ids.le(hand_sizes.long().clamp(min=0, max=8).unsqueeze(1))
+        filtered_logits = outputs.expected_trick_logits.masked_fill(
+            ~valid_classes,
+            torch.finfo(outputs.expected_trick_logits.dtype).min,
+        )
+        losses = F.cross_entropy(
+            filtered_logits,
+            targets.long().clamp(min=0, max=8),
+            reduction="none",
+        )
+        return (losses * bidding_mask).sum() / bidding_mask.sum().clamp_min(1.0)
+
+    def _entropy_bonus(self, entropy_values: Tensor, batch_obs: Dict[str, Tensor]) -> Tensor:
+        phases = batch_obs.get("phase")
+        if phases is None:
+            return entropy_values.mean() * self.entropy_coef
+        scales = torch.where(
+            phases.eq(0),
+            torch.full_like(entropy_values, self.config.bid_entropy_scale),
+            torch.full_like(entropy_values, self.config.play_entropy_scale),
+        )
+        return (entropy_values * scales).mean() * self.entropy_coef

@@ -6,6 +6,7 @@ import math
 import random
 import multiprocessing as mp
 import time
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -19,12 +20,21 @@ from romanian_whist.agents.baselines import BidPlayHeuristicAgent, RandomLegalAg
 from romanian_whist.agents.checkpoint import save_checkpoint
 from romanian_whist.agents.model import PolicyAgent, PolicyNetworkConfig, WhistPolicyNetwork, batch_observations, masked_logits
 from romanian_whist.env.romanian_whist import RomanianWhistEnv
+from romanian_whist.rules.cards import rank, suit
 from romanian_whist.rules.config import OneCardMode, WhistVariantConfig
 from romanian_whist.train.curriculum import CurriculumScheduler
-from romanian_whist.train.eval import TournamentRunner, average_stat_dicts, stats_to_dict
+from romanian_whist.train.eval import (
+    TournamentRunner,
+    average_stat_dicts,
+    bid_records_from_events,
+    bid_stats_from_records,
+    stats_to_dict,
+)
 from romanian_whist.train.ppo import PPOConfig, PPOTrainer, RolloutBuffer
 
 SCRIPTED_AGENT_TYPES = (RandomLegalAgent, SafeHeuristicAgent, BidPlayHeuristicAgent)
+LATEST_OPPONENT_GREEDY_PROB = 0.35
+SNAPSHOT_OPPONENT_GREEDY_PROB = 0.65
 
 
 @dataclass
@@ -47,7 +57,8 @@ class LeagueConfig:
     rollout_one_card_modes: Optional[tuple[OneCardMode, ...]] = None
     reward_shaping_coef: float = 0.5
     final_reward_shaping_coef: Optional[float] = None
-    imitation_episodes: int = 0
+    bid_reward_shaping_coef: float = 0.25
+    final_bid_reward_shaping_coef: Optional[float] = None
     rollout_workers: int = 1
     eval_workers: int = 1
     save_best_checkpoint: bool = True
@@ -235,9 +246,14 @@ def _belief_targets(env: RomanianWhistEnv, observer_seat: int, observation: Dict
 
 def _training_observation(env: RomanianWhistEnv, seat: int, observation: Dict[str, object]) -> Dict[str, object]:
     labels, mask = _belief_targets(env, seat, observation)
+    state = env.game.round_state
+    expected_trick_target = 0
+    if state is not None:
+        expected_trick_target = _heuristic_bid_target(state.hands[seat], state.trump_suit, state.hand_size)
     enriched = dict(observation)
     enriched["belief_target_owner"] = labels
     enriched["belief_target_mask"] = mask
+    enriched["expected_trick_target"] = expected_trick_target
     return enriched
 
 
@@ -246,6 +262,118 @@ def _chunk_items(items: Sequence[dict], chunks: int) -> List[List[dict]]:
         return []
     chunk_size = int(math.ceil(len(items) / float(max(1, chunks))))
     return [list(items[index : index + chunk_size]) for index in range(0, len(items), chunk_size)]
+
+
+def _estimate_expected_tricks(cards: Sequence[int], trump_suit: Optional[int], hand_size: int) -> float:
+    total = 0.0
+    suit_counts = Counter(suit(card_id) for card_id in cards)
+    suit_ranks = {}  # type: Dict[int, set[int]]
+    for card_id in cards:
+        card_suit = suit(card_id)
+        card_rank = rank(card_id)
+        suit_ranks.setdefault(card_suit, set()).add(card_rank)
+        if card_rank == 12:
+            total += 1.00
+        elif card_rank == 11:
+            total += 0.70
+        elif card_rank == 10:
+            total += 0.40
+        elif card_rank == 9:
+            total += 0.20
+        elif card_rank == 8:
+            total += 0.10
+        elif card_rank == 7:
+            total += 0.05
+        if trump_suit is not None and card_suit == trump_suit:
+            if card_rank >= 11:
+                total += 0.30
+            elif card_rank >= 8:
+                total += 0.20
+            else:
+                total += 0.10
+    for suit_id, ranks_in_suit in suit_ranks.items():
+        if 12 in ranks_in_suit and 11 in ranks_in_suit:
+            total += 0.40
+        if (12 in ranks_in_suit and 10 in ranks_in_suit) or (11 in ranks_in_suit and 10 in ranks_in_suit):
+            total += 0.20
+        if suit_counts[suit_id] >= 3:
+            total += 0.15
+        if suit_counts[suit_id] >= 4:
+            total += 0.10 * float(suit_counts[suit_id] - 3)
+    return min(float(hand_size), max(0.0, total))
+
+
+def _heuristic_bid_target(cards: Sequence[int], trump_suit: Optional[int], hand_size: int) -> int:
+    return int(round(_estimate_expected_tricks(cards, trump_suit, hand_size)))
+
+
+def _heuristic_bid_target_for_game(env: RomanianWhistEnv, seat: int) -> int:
+    state = env.game.round_state
+    if state is None:
+        return 0
+    return _heuristic_bid_target(state.hands[seat], state.trump_suit, state.hand_size)
+
+
+def _bid_alignment_reward(bid: int, target_bid: int, hand_size: int) -> float:
+    return 1.0 - (abs(float(bid) - float(target_bid)) / float(max(1, hand_size)))
+
+
+def _bid_metrics_from_records(records: Sequence[Dict[str, float]], prefix: str) -> Dict[str, float]:
+    bid_actions = [int(record["bid"]) for record in records]
+    stats = {
+        "{prefix}/count".format(prefix=prefix): float(len(records)),
+        "{prefix}/min".format(prefix=prefix): 0.0,
+        "{prefix}/max".format(prefix=prefix): 0.0,
+        "{prefix}/mean".format(prefix=prefix): 0.0,
+        "{prefix}/mae_vs_actual".format(prefix=prefix): 0.0,
+        "{prefix}/mae_vs_estimate".format(prefix=prefix): 0.0,
+        "{prefix}/underbid_rate".format(prefix=prefix): 0.0,
+        "{prefix}/overbid_rate".format(prefix=prefix): 0.0,
+        "{prefix}/strong_hand_underbid_rate".format(prefix=prefix): 0.0,
+    }
+    for bid in range(9):
+        stats["{prefix}/rate_{bid}".format(prefix=prefix, bid=bid)] = 0.0
+    for hand_size in range(1, 9):
+        stats["{prefix}/by_hand_size/{hand_size}/mean".format(prefix=prefix, hand_size=hand_size)] = 0.0
+        stats["{prefix}/by_hand_size/{hand_size}/rate_1".format(prefix=prefix, hand_size=hand_size)] = 0.0
+    if not records:
+        return stats
+    stats["{prefix}/min".format(prefix=prefix)] = float(min(bid_actions))
+    stats["{prefix}/max".format(prefix=prefix)] = float(max(bid_actions))
+    stats["{prefix}/mean".format(prefix=prefix)] = sum(bid_actions) / float(len(records))
+    for bid in range(9):
+        stats["{prefix}/rate_{bid}".format(prefix=prefix, bid=bid)] = (
+            sum(1 for action in bid_actions if action == bid) / float(len(records))
+        )
+    stats["{prefix}/mae_vs_actual".format(prefix=prefix)] = (
+        sum(abs(float(record["bid"]) - float(record["actual_tricks"])) for record in records) / float(len(records))
+    )
+    stats["{prefix}/mae_vs_estimate".format(prefix=prefix)] = (
+        sum(abs(float(record["bid"]) - float(record["target_bid"])) for record in records) / float(len(records))
+    )
+    stats["{prefix}/underbid_rate".format(prefix=prefix)] = (
+        sum(1.0 for record in records if float(record["bid"]) < float(record["actual_tricks"])) / float(len(records))
+    )
+    stats["{prefix}/overbid_rate".format(prefix=prefix)] = (
+        sum(1.0 for record in records if float(record["bid"]) > float(record["actual_tricks"])) / float(len(records))
+    )
+    strong_records = [record for record in records if float(record["target_bid"]) >= 3.0]
+    stats["{prefix}/strong_hand_underbid_rate".format(prefix=prefix)] = (
+        sum(1.0 for record in strong_records if float(record["bid"]) < float(record["target_bid"])) / float(len(strong_records))
+        if strong_records
+        else 0.0
+    )
+    for hand_size in range(1, 9):
+        sized_records = [record for record in records if int(record["hand_size"]) == hand_size]
+        if not sized_records:
+            continue
+        stats["{prefix}/by_hand_size/{hand_size}/mean".format(prefix=prefix, hand_size=hand_size)] = (
+            sum(float(record["bid"]) for record in sized_records) / float(len(sized_records))
+        )
+        stats["{prefix}/by_hand_size/{hand_size}/rate_1".format(prefix=prefix, hand_size=hand_size)] = (
+            sum(1.0 for record in sized_records if int(record["bid"]) == 1) / float(len(sized_records))
+        )
+    return stats
 
 
 def _rollout_worker(
@@ -270,6 +398,7 @@ def _rollout_worker(
     dones = []
     next_values = []
     trajectory_ids = []
+    bid_records = []
 
     episode_states = []
     for episode in task["episodes"]:
@@ -312,6 +441,7 @@ def _rollout_worker(
                 "opponent_agents": opponent_agents,
                 "last_transition_index": None,
                 "trajectory_id": int(episode["trajectory_id"]),
+                "target_bids_by_round": {},
             }
         )
 
@@ -328,6 +458,7 @@ def _rollout_worker(
             if seat == state["focal_seat"]:
                 policy_observation = env.observe(acting_agent)
                 observation = _training_observation(env, seat, policy_observation)
+                round_state = env.game.round_state
                 policy_batches.setdefault(("latest", -1), []).append(
                     {
                         "state": state,
@@ -335,18 +466,22 @@ def _rollout_worker(
                         "training_observation": observation,
                         "greedy": False,
                         "record_transition": True,
+                        "bid_target": observation["expected_trick_target"],
+                        "hand_size": 0 if round_state is None else round_state.hand_size,
+                        "round_index": -1 if round_state is None else round_state.round_index,
                     }
                 )
                 continue
             agent_spec = state["opponent_agents"][seat]
             if agent_spec["kind"] == "scripted":
-                before_potential = _round_potential(env, state["focal_seat"])
+                phase = env.game.round_state.phase if env.game.round_state is not None else ""
+                before_potential = _round_potential(env, state["focal_seat"]) if phase == "play" else 0.0
                 action = agent_spec["agent"].select_action_from_game(env.game, seat)
                 outcome = env.step_outcome(action)
-                after_potential = 0.0 if outcome.match_finished else _round_potential(env, state["focal_seat"])
-                shaped_reward = outcome.rewards[state["focal_seat"]] + (
-                    float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
-                )
+                after_potential = 0.0 if outcome.match_finished or phase != "play" else _round_potential(env, state["focal_seat"])
+                shaped_reward = outcome.rewards[state["focal_seat"]]
+                if phase == "play":
+                    shaped_reward += float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
                 if state["last_transition_index"] is not None:
                     rewards[state["last_transition_index"]] += shaped_reward
                     dones[state["last_transition_index"]] = outcome.match_finished
@@ -387,12 +522,26 @@ def _rollout_worker(
             for key, batch_results in zip(ordered_keys, multi_results):
                 for item, (action, log_prob, value) in zip(policy_batches[key], batch_results):
                     state = item["state"]
-                    before_potential = _round_potential(state["env"], state["focal_seat"])
-                    outcome = state["env"].step_outcome(action)
-                    after_potential = 0.0 if outcome.match_finished else _round_potential(state["env"], state["focal_seat"])
-                    shaped_reward = outcome.rewards[state["focal_seat"]] + (
-                        float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
-                    )
+                    env = state["env"]
+                    is_focal_bid = bool(item["record_transition"]) and action < 9
+                    bid_target = int(item.get("bid_target", 0))
+                    hand_size = int(item.get("hand_size", 1))
+                    phase = env.game.round_state.phase if env.game.round_state is not None else ""
+                    if is_focal_bid:
+                        round_index = int(item["round_index"])
+                        state["target_bids_by_round"].setdefault(round_index, {})[state["focal_seat"]] = bid_target
+                    before_potential = _round_potential(env, state["focal_seat"]) if phase == "play" else 0.0
+                    outcome = env.step_outcome(action)
+                    after_potential = 0.0 if outcome.match_finished or phase != "play" else _round_potential(env, state["focal_seat"])
+                    shaped_reward = outcome.rewards[state["focal_seat"]]
+                    if is_focal_bid:
+                        shaped_reward += float(task.get("bid_reward_shaping_coef", 0.0)) * _bid_alignment_reward(
+                            action,
+                            bid_target,
+                            hand_size,
+                        )
+                    elif phase == "play":
+                        shaped_reward += float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
                     if item["record_transition"]:
                         if state["last_transition_index"] is not None:
                             next_values[state["last_transition_index"]] = value
@@ -419,12 +568,26 @@ def _rollout_worker(
                 )
                 for item, (action, log_prob, value) in zip(items, batch_results):
                     state = item["state"]
-                    before_potential = _round_potential(state["env"], state["focal_seat"])
-                    outcome = state["env"].step_outcome(action)
-                    after_potential = 0.0 if outcome.match_finished else _round_potential(state["env"], state["focal_seat"])
-                    shaped_reward = outcome.rewards[state["focal_seat"]] + (
-                        float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
-                    )
+                    env = state["env"]
+                    is_focal_bid = bool(item["record_transition"]) and action < 9
+                    bid_target = int(item.get("bid_target", 0))
+                    hand_size = int(item.get("hand_size", 1))
+                    phase = env.game.round_state.phase if env.game.round_state is not None else ""
+                    if is_focal_bid:
+                        round_index = int(item["round_index"])
+                        state["target_bids_by_round"].setdefault(round_index, {})[state["focal_seat"]] = bid_target
+                    before_potential = _round_potential(env, state["focal_seat"]) if phase == "play" else 0.0
+                    outcome = env.step_outcome(action)
+                    after_potential = 0.0 if outcome.match_finished or phase != "play" else _round_potential(env, state["focal_seat"])
+                    shaped_reward = outcome.rewards[state["focal_seat"]]
+                    if is_focal_bid:
+                        shaped_reward += float(task.get("bid_reward_shaping_coef", 0.0)) * _bid_alignment_reward(
+                            action,
+                            bid_target,
+                            hand_size,
+                        )
+                    elif phase == "play":
+                        shaped_reward += float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
                     if item["record_transition"]:
                         if state["last_transition_index"] is not None:
                             next_values[state["last_transition_index"]] = value
@@ -445,6 +608,25 @@ def _rollout_worker(
         if not progress_made:
             raise RuntimeError("Rollout worker made no progress while active environments remain.")
 
+    for state in episode_states:
+        replay = state["env"].serialize_replay()
+        seat_labels = [str(index) for index in range(state["env"].config.players)]
+        episode_bid_records = bid_records_from_events(
+            replay["events"],
+            seat_labels,
+            state["target_bids_by_round"],
+        )
+        bid_records.extend(
+            {
+                "hand_size": float(record["hand_size"]),
+                "bid": float(record["bid"]),
+                "target_bid": float(record["target_bid"]),
+                "actual_tricks": float(record["actual_tricks"]),
+            }
+            for record in episode_bid_records
+            if str(record["label"]) == str(state["focal_seat"])
+        )
+
     return {
         "observations": observations,
         "actions": actions,
@@ -454,6 +636,7 @@ def _rollout_worker(
         "rewards": rewards,
         "dones": dones,
         "trajectory_ids": trajectory_ids,
+        "bid_records": bid_records,
         "episodes": len(task["episodes"]),
         "elapsed_sec": time.perf_counter() - start_time,
     }
@@ -620,9 +803,13 @@ def _evaluation_worker(task: Dict[str, object]) -> Dict[str, object]:
         env.reset(seed=seed + int(match_index))
         rotation = int(match_index) % len(participants)
         seat_order = participants[rotation:] + participants[:rotation]
+        target_bids_by_round = {}  # type: Dict[int, Dict[int, int]]
         while not all(env.terminations.values()):
             acting_agent = env.agent_selection
             seat = env.agent_index(acting_agent)
+            round_state = env.game.round_state
+            if round_state is not None and round_state.phase == "bidding":
+                target_bids_by_round.setdefault(round_state.round_index, {})[seat] = _heuristic_bid_target_for_game(env, seat)
             _, agent = seat_order[seat]
             if isinstance(agent, SCRIPTED_AGENT_TYPES):
                 action = agent.select_action_from_game(env.game, seat)
@@ -636,6 +823,7 @@ def _evaluation_worker(task: Dict[str, object]) -> Dict[str, object]:
                 "seat_labels": [name for name, _ in seat_order],
                 "final_scores": list(replay["scores"]),
                 "events": replay["events"],
+                "bid_records": bid_records_from_events(replay["events"], [name for name, _ in seat_order], target_bids_by_round),
             }
         )
     return {
@@ -780,7 +968,14 @@ class LeagueTrainer:
             if self.league_config.final_reward_shaping_coef is not None
             else self.league_config.reward_shaping_coef
         )
+        self.initial_bid_reward_shaping_coef = self.league_config.bid_reward_shaping_coef
+        self.final_bid_reward_shaping_coef = (
+            self.league_config.final_bid_reward_shaping_coef
+            if self.league_config.final_bid_reward_shaping_coef is not None
+            else self.league_config.bid_reward_shaping_coef
+        )
         self.current_reward_shaping_coef = self.league_config.reward_shaping_coef
+        self.current_bid_reward_shaping_coef = self.league_config.bid_reward_shaping_coef
         self.curriculum = CurriculumScheduler(self.league_config.total_updates)
         self.snapshots = []  # type: List[WhistPolicyNetwork]
         self.best_snapshot = None  # type: Optional[WhistPolicyNetwork]
@@ -811,18 +1006,15 @@ class LeagueTrainer:
         total_updates = updates or self.league_config.total_updates
         history = []
         try:
-            if start_update == 0 and self.league_config.imitation_episodes > 0:
-                imitation_metrics = self.pretrain_imitation(self.league_config.imitation_episodes)
-                if self.writer is not None:
-                    for key, value in imitation_metrics.items():
-                        self.writer.add_scalar("pretrain/{key}".format(key=key), float(value), 0)
-                    self.writer.flush()
             for local_update_index in range(total_updates):
                 update_index = start_update + local_update_index + 1
                 anneal_progress = self._anneal_progress(update_index, start_update, total_updates)
                 self.ppo.set_anneal_progress(anneal_progress)
                 self.current_reward_shaping_coef = self.initial_reward_shaping_coef + (
                     (self.final_reward_shaping_coef - self.initial_reward_shaping_coef) * anneal_progress
+                )
+                self.current_bid_reward_shaping_coef = self.initial_bid_reward_shaping_coef + (
+                    (self.final_bid_reward_shaping_coef - self.initial_bid_reward_shaping_coef) * anneal_progress
                 )
                 stage = self.curriculum.stage_for_update(update_index - 1)
                 rollout_player_counts = self._rollout_player_counts(stage.player_counts)
@@ -849,6 +1041,7 @@ class LeagueTrainer:
                 )
                 metrics["entropy_coef"] = self.ppo.entropy_coef
                 metrics["reward_shaping_coef"] = self.current_reward_shaping_coef
+                metrics["bid_reward_shaping_coef"] = self.current_bid_reward_shaping_coef
                 metrics.update(self.last_rollout_stats)
                 evaluation = None
                 should_evaluate = (
@@ -944,12 +1137,14 @@ class LeagueTrainer:
                 "latest_policy_state": latest_policy_state,
                 "snapshot_policy_states": [],
                 "reward_shaping_coef": self.current_reward_shaping_coef,
+                "bid_reward_shaping_coef": self.current_bid_reward_shaping_coef,
             }
             for chunk in _chunk_items(task_episodes, worker_count)
         ]
 
         results = self.rollout_pool.map(tasks)
         worker_elapsed = []
+        bid_records = []
         for result in results:
             buffer.observations.extend(result["observations"])
             buffer.actions.extend(result["actions"])
@@ -959,6 +1154,7 @@ class LeagueTrainer:
             buffer.rewards.extend(result["rewards"])
             buffer.dones.extend(result["dones"])
             buffer.trajectory_ids.extend(result["trajectory_ids"])
+            bid_records.extend(result.get("bid_records", []))
             worker_elapsed.append(float(result["elapsed_sec"]))
         self.last_rollout_stats = {
             "rollout/episodes": float(episodes),
@@ -969,6 +1165,7 @@ class LeagueTrainer:
             ),
             "rollout/worker_task_sec_max": max(worker_elapsed) if worker_elapsed else 0.0,
         }
+        self.last_rollout_stats.update(_bid_metrics_from_records(bid_records, "policy_bid"))
         return buffer
 
     def collect_rollouts(
@@ -985,14 +1182,15 @@ class LeagueTrainer:
         buffer = RolloutBuffer()
         player_count_schedule = self._player_count_schedule(player_counts, episodes)
         active_snapshot_indices = self._select_active_snapshot_indices()
+        bid_records = []
         for episode_index, players in enumerate(player_count_schedule):
             config = self.variant_config.replace(players=players, one_card_modes=tuple(one_card_modes))
             env = RomanianWhistEnv(config)
             env.reset(seed=self.rng.randint(0, 1_000_000))
             focal_seat = episode_index % players
-            focal_agent_name = env.possible_agents[focal_seat]
             opponent_agents = self._sample_opponents(players, focal_seat, active_snapshot_indices)
             last_transition_index = None
+            target_bids_by_round = {}  # type: Dict[int, Dict[int, int]]
             while not all(env.terminations.values()):
                 acting_agent = env.agent_selection
                 seat = env.agent_index(acting_agent)
@@ -1004,12 +1202,21 @@ class LeagueTrainer:
                     action, log_prob, value = self.ppo.select_action(observation)
                     if last_transition_index is not None:
                         buffer.next_values[last_transition_index] = value
-                    before_potential = _round_potential(env, focal_seat)
+                    state = env.game.round_state
+                    hand_size = 1 if state is None else state.hand_size
+                    round_index = -1 if state is None else state.round_index
+                    target_bid = int(training_observation["expected_trick_target"])
+                    phase = "" if state is None else state.phase
+                    if action < 9:
+                        target_bids_by_round.setdefault(round_index, {})[focal_seat] = target_bid
+                    before_potential = _round_potential(env, focal_seat) if phase == "play" else 0.0
                     outcome = env.step_outcome(action)
-                    after_potential = 0.0 if outcome.match_finished else _round_potential(env, focal_seat)
-                    reward = outcome.rewards[focal_seat] + (
-                        self.current_reward_shaping_coef * (after_potential - before_potential)
-                    )
+                    after_potential = 0.0 if outcome.match_finished or phase != "play" else _round_potential(env, focal_seat)
+                    reward = outcome.rewards[focal_seat]
+                    if action < 9:
+                        reward += self.current_bid_reward_shaping_coef * _bid_alignment_reward(action, target_bid, hand_size)
+                    elif phase == "play":
+                        reward += self.current_reward_shaping_coef * (after_potential - before_potential)
                     done = outcome.match_finished
                     last_transition_index = buffer.add(
                         observation=training_observation,
@@ -1021,16 +1228,30 @@ class LeagueTrainer:
                         trajectory_id=episode_index,
                     )
                 else:
-                    before_potential = _round_potential(env, focal_seat)
+                    phase = env.game.round_state.phase if env.game.round_state is not None else ""
+                    before_potential = _round_potential(env, focal_seat) if phase == "play" else 0.0
                     action = scripted_agent.select_action_from_game(env.game, seat) if scripted_agent is not None else opponent_agents[seat].select_action(observation)
                     outcome = env.step_outcome(action)
-                    after_potential = 0.0 if outcome.match_finished else _round_potential(env, focal_seat)
-                    shaped_reward = outcome.rewards[focal_seat] + (
-                        self.current_reward_shaping_coef * (after_potential - before_potential)
-                    )
+                    after_potential = 0.0 if outcome.match_finished or phase != "play" else _round_potential(env, focal_seat)
+                    shaped_reward = outcome.rewards[focal_seat]
+                    if phase == "play":
+                        shaped_reward += self.current_reward_shaping_coef * (after_potential - before_potential)
                     if last_transition_index is not None:
                         buffer.rewards[last_transition_index] += shaped_reward
                         buffer.dones[last_transition_index] = outcome.match_finished
+            replay = env.serialize_replay()
+            seat_labels = [str(index) for index in range(players)]
+            episode_bid_records = bid_records_from_events(replay["events"], seat_labels, target_bids_by_round)
+            bid_records.extend(
+                {
+                    "hand_size": float(record["hand_size"]),
+                    "bid": float(record["bid"]),
+                    "target_bid": float(record["target_bid"]),
+                    "actual_tricks": float(record["actual_tricks"]),
+                }
+                for record in episode_bid_records
+                if str(record["label"]) == str(focal_seat)
+            )
         elapsed = time.perf_counter() - start_time
         self.last_rollout_stats = {
             "rollout/episodes": float(episodes),
@@ -1038,6 +1259,7 @@ class LeagueTrainer:
             "rollout/worker_task_sec_mean": elapsed,
             "rollout/worker_task_sec_max": elapsed,
         }
+        self.last_rollout_stats.update(_bid_metrics_from_records(bid_records, "policy_bid"))
         return buffer
 
     def evaluate(self, matches: int = 8) -> Dict[str, object]:
@@ -1047,7 +1269,10 @@ class LeagueTrainer:
         per_player_count = {}  # type: Dict[str, Dict[str, Dict[str, float]]]
         stat_dicts = []
         for players in self.league_config.evaluation_player_counts:
-            runner = TournamentRunner(self.variant_config.replace(players=players))
+            runner = TournamentRunner(
+                self.variant_config.replace(players=players),
+                bid_target_resolver=self._evaluation_bid_target,
+            )
             participants, label_groups = self._evaluation_participants(players)
             raw_stats = stats_to_dict(runner.run(participants, matches=matches, seed=self.league_config.seed + players))
             stats = self._aggregate_label_groups(raw_stats, label_groups)
@@ -1097,6 +1322,7 @@ class LeagueTrainer:
                     "latest_policy_state": latest_policy_state,
                     "snapshot_policy_states": snapshot_policy_states,
                     "reward_shaping_coef": self.current_reward_shaping_coef,
+                    "bid_reward_shaping_coef": self.current_bid_reward_shaping_coef,
                 }
                 for chunk in _chunk_items(task_episodes, worker_count)
         ]
@@ -1107,6 +1333,7 @@ class LeagueTrainer:
             self.rollout_pool = PersistentRolloutPool(worker_count)
         results = self.rollout_pool.map(tasks)
         worker_elapsed = []
+        bid_records = []
         for result in results:
             buffer.observations.extend(result["observations"])
             buffer.actions.extend(result["actions"])
@@ -1116,6 +1343,7 @@ class LeagueTrainer:
             buffer.rewards.extend(result["rewards"])
             buffer.dones.extend(result["dones"])
             buffer.trajectory_ids.extend(result["trajectory_ids"])
+            bid_records.extend(result.get("bid_records", []))
             worker_elapsed.append(float(result["elapsed_sec"]))
         self.last_rollout_stats = {
             "rollout/episodes": float(episodes),
@@ -1125,29 +1353,8 @@ class LeagueTrainer:
             ),
             "rollout/worker_task_sec_max": max(worker_elapsed) if worker_elapsed else 0.0,
         }
+        self.last_rollout_stats.update(_bid_metrics_from_records(bid_records, "policy_bid"))
         return buffer
-
-    def pretrain_imitation(self, episodes: int) -> Dict[str, float]:
-        player_counts = self._rollout_player_counts(self.curriculum.stage_for_update(0).player_counts)
-        one_card_modes = self._rollout_one_card_modes(self.variant_config.one_card_modes)
-        observations = []
-        actions = []
-        teacher_roles = ("safe", "heuristic")
-        for episode_index, players in enumerate(self._player_count_schedule(player_counts, episodes)):
-            teacher_role = teacher_roles[episode_index % len(teacher_roles)]
-            config = self.variant_config.replace(players=players, one_card_modes=tuple(one_card_modes))
-            env = RomanianWhistEnv(config)
-            env.reset(seed=self.rng.randint(0, 1_000_000))
-            teachers = [_baseline_agent(teacher_role, self.rng.randint(0, 1_000_000)) for _ in range(players)]
-            while not all(env.terminations.values()):
-                acting_agent = env.agent_selection
-                seat = env.agent_index(acting_agent)
-                observation = env.observe(acting_agent)
-                observations.append(_training_observation(env, seat, observation))
-                teacher_action = teachers[seat].select_action_from_game(env.game, seat)
-                actions.append(teacher_action)
-                env.step(teacher_action, include_observation=False)
-        return self.ppo.imitation_update(observations, actions)
 
     @staticmethod
     def _anneal_progress(update_index: int, start_update: int, total_updates: int) -> float:
@@ -1180,7 +1387,10 @@ class LeagueTrainer:
                 grouped_results.setdefault(int(result["players"]), []).extend(result["matches"])
                 worker_elapsed.append(float(result["elapsed_sec"]))
         for players in self.league_config.evaluation_player_counts:
-            runner = TournamentRunner(self.variant_config.replace(players=players))
+            runner = TournamentRunner(
+                self.variant_config.replace(players=players),
+                bid_target_resolver=self._evaluation_bid_target,
+            )
             participants, label_groups = self._evaluation_participants(players)
             stats = self._aggregate_label_groups(
                 stats_to_dict(runner.summarize_match_results(grouped_results.get(players, []), participants)),
@@ -1205,7 +1415,16 @@ class LeagueTrainer:
     @staticmethod
     def selection_score(evaluation: Dict[str, object]) -> float:
         overall = evaluation["overall"]
-        return float(overall["average_scores"]["policy"])
+        return (
+            float(overall["average_scores"]["policy"])
+            + (20.0 * float(overall["contract_hit_rate"]["policy"]))
+            + (2.0 * float(overall["trick_differential"]["policy"]))
+            - (5.0 * float(overall["strong_hand_underbid_rate"]["policy"]))
+        )
+
+    @staticmethod
+    def _evaluation_bid_target(env: RomanianWhistEnv, seat: int) -> int:
+        return _heuristic_bid_target_for_game(env, seat)
 
     def _player_count_schedule(self, player_counts: Sequence[int], episodes: int) -> List[int]:
         counts = list(dict.fromkeys(player_counts))
@@ -1272,11 +1491,23 @@ class LeagueTrainer:
             opponent_role = self._sample_opponent_role(bool(available_indices))
             if opponent_role == "snapshot":
                 snapshot = all_snapshots[self.rng.choice(available_indices)]
-                pool.append(PolicyAgent(snapshot, device=self.league_config.device, greedy=True))
+                pool.append(
+                    PolicyAgent(
+                        snapshot,
+                        device=self.league_config.device,
+                        greedy=self.rng.random() < SNAPSHOT_OPPONENT_GREEDY_PROB,
+                    )
+                )
             elif opponent_role == "scripted":
                 pool.append(copy.deepcopy(self.rng.choice(self.scripted_pool)))
             else:
-                pool.append(PolicyAgent(self.policy, device=self.league_config.device, greedy=True))
+                pool.append(
+                    PolicyAgent(
+                        self.policy,
+                        device=self.league_config.device,
+                        greedy=self.rng.random() < LATEST_OPPONENT_GREEDY_PROB,
+                    )
+                )
         return pool
 
     def _select_active_snapshot_indices(self) -> List[int]:
@@ -1302,12 +1533,18 @@ class LeagueTrainer:
             opponent_role = self._sample_opponent_role(bool(available_snapshots))
             if opponent_role == "snapshot":
                 snapshot_index = self.rng.choice(available_snapshots)
-                specs.append({"role": "snapshot", "snapshot_index": snapshot_index, "greedy": True})
+                specs.append(
+                    {
+                        "role": "snapshot",
+                        "snapshot_index": snapshot_index,
+                        "greedy": self.rng.random() < SNAPSHOT_OPPONENT_GREEDY_PROB,
+                    }
+                )
             elif opponent_role == "scripted":
                 baseline_role = self.rng.choice(("random", "safe", "heuristic"))
                 specs.append({"role": baseline_role, "seed": self.rng.randint(0, 1_000_000)})
             else:
-                specs.append({"role": "latest", "greedy": True})
+                specs.append({"role": "latest", "greedy": self.rng.random() < LATEST_OPPONENT_GREEDY_PROB})
         return specs
 
     def _sample_opponent_role(self, snapshots_available: bool) -> str:

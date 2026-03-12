@@ -44,3 +44,4 @@ def test_policy_forward_with_aux_outputs_belief_logits() -> None:
     assert tuple(outputs.logits.shape) == (1, 61)
     assert tuple(outputs.values.shape) == (1,)
     assert tuple(outputs.belief_logits.shape) == (1, 52, policy.max_players + 2)
+    assert tuple(outputs.expected_trick_logits.shape) == (1, 9)

@@ -21,7 +21,21 @@ romanian-whist spectate --players 4 --bot heuristic
 ## Universal training
 
 ```bash
-./scripts/train_universal_model.sh
+uv run romanian-whist train \
+  --output runs/universal \
+  --updates 100 \
+  --episodes-per-update 24 \
+  --learning-rate 0.0003 \
+  --embed-dim 128 \
+  --evaluation-matches 4 \
+  --evaluation-every 1 \
+  --reward-shaping 0.5 \
+  --rollout-workers 1 \
+  --eval-workers 1 \
+  --device cpu \
+  --tensorboard-logdir runs/universal/tensorboard \
+  --universal \
+  --seed 0
 ```
 
 This trains one shared model across `3-6` players, writes rolling checkpoints under `runs/universal`, and keeps `best.pt` plus per-update evaluation reports aggregated and broken out by player count.
@@ -35,77 +49,103 @@ uv run tensorboard --logdir runs
 Resume a previous run from its latest checkpoint:
 
 ```bash
-RESUME_FROM=runs/universal/update-0500.pt \
-DEVICE=cuda \
-UPDATES=500 \
-OUTPUT=runs/universal \
-./scripts/train_universal_model.sh
+uv run romanian-whist train \
+  --output runs/universal \
+  --updates 500 \
+  --episodes-per-update 24 \
+  --learning-rate 0.0003 \
+  --embed-dim 128 \
+  --evaluation-matches 4 \
+  --evaluation-every 1 \
+  --reward-shaping 0.5 \
+  --rollout-workers 1 \
+  --eval-workers 1 \
+  --device cuda \
+  --tensorboard-logdir runs/universal/tensorboard \
+  --universal \
+  --seed 0 \
+  --resume-from runs/universal/update-0500.pt
 ```
 
 For long CUDA runs, reduce evaluation overhead by evaluating every few updates instead of every update:
 
 ```bash
-DEVICE=cuda \
-UPDATES=500 \
-EPISODES_PER_UPDATE=64 \
-LEARNING_RATE=0.0001 \
-EMBED_DIM=128 \
-EVALUATION_MATCHES=16 \
-EVALUATION_EVERY=10 \
-ROLLOUT_WORKERS=8 \
-EVAL_WORKERS=4 \
-OUTPUT=runs/universal-fast \
-./scripts/train_universal_model.sh
+uv run romanian-whist train \
+  --output runs/universal-fast \
+  --updates 500 \
+  --episodes-per-update 64 \
+  --learning-rate 0.0001 \
+  --embed-dim 128 \
+  --evaluation-matches 16 \
+  --evaluation-every 10 \
+  --reward-shaping 0.5 \
+  --rollout-workers 8 \
+  --eval-workers 4 \
+  --device cuda \
+  --tensorboard-logdir runs/universal-fast/tensorboard \
+  --universal \
+  --seed 0
 ```
 
 Useful training knobs:
 - `REWARD_SHAPING`: scales dense contract-progress shaping during rollouts. Default `0.5`.
-- `IMITATION_EPISODES`: runs behavior-cloning warmup from scripted experts before PPO. Default `128` in the universal script.
 
 ## Six-player training
 
 If real-world play is usually six-handed, train a dedicated 6-player model first:
 
 ```bash
-./scripts/train_6p_model.sh
+uv run romanian-whist train \
+  --output runs/six-player \
+  --updates 300 \
+  --episodes-per-update 32 \
+  --learning-rate 0.0001 \
+  --embed-dim 256 \
+  --players 6 \
+  --fixed-player-count \
+  --evaluation-matches 8 \
+  --evaluation-every 5 \
+  --entropy-coef 0.01 \
+  --final-entropy-coef 0.001 \
+  --gae-lambda 0.95 \
+  --reward-shaping 0.5 \
+  --final-reward-shaping 0.1 \
+  --latest-weight 0.5 \
+  --snapshot-weight 0.35 \
+  --scripted-weight 0.15 \
+  --rollout-workers 8 \
+  --eval-workers 4 \
+  --device cuda \
+  --tensorboard-logdir runs/six-player/tensorboard \
+  --seed 0
 ```
 
-The 6-player script defaults to a larger model and fixed 6-player training:
+Example six-player run with the larger fixed-player setup:
 
 ```bash
-DEVICE=cuda \
-UPDATES=300 \
-EPISODES_PER_UPDATE=32 \
-LEARNING_RATE=0.0001 \
-EMBED_DIM=256 \
-EVALUATION_MATCHES=8 \
-EVALUATION_EVERY=5 \
-ROLLOUT_WORKERS=8 \
-EVAL_WORKERS=4 \
-OUTPUT=runs/six-player \
-./scripts/train_6p_model.sh
-```
-
-The 6-player script also enables stronger warm-start settings by default:
-- `REWARD_SHAPING=0.5`
-- `IMITATION_EPISODES=256`
-
-Example long 6-player run with the new shaping and imitation warmup enabled explicitly:
-
-```bash
-DEVICE=cuda \
-UPDATES=300 \
-EPISODES_PER_UPDATE=64 \
-LEARNING_RATE=0.0001 \
-EMBED_DIM=256 \
-EVALUATION_MATCHES=16 \
-EVALUATION_EVERY=5 \
-REWARD_SHAPING=0.5 \
-IMITATION_EPISODES=256 \
-ROLLOUT_WORKERS=8 \
-EVAL_WORKERS=4 \
-OUTPUT=runs/six-player-strong \
-./scripts/train_6p_model.sh
+uv run romanian-whist train \
+  --output runs/six-player-strong \
+  --updates 300 \
+  --episodes-per-update 64 \
+  --learning-rate 0.0001 \
+  --embed-dim 256 \
+  --players 6 \
+  --fixed-player-count \
+  --evaluation-matches 16 \
+  --evaluation-every 5 \
+  --entropy-coef 0.01 \
+  --final-entropy-coef 0.001 \
+  --gae-lambda 0.95 \
+  --reward-shaping 0.5 \
+  --final-reward-shaping 0.1 \
+  --latest-weight 0.5 \
+  --snapshot-weight 0.35 \
+  --scripted-weight 0.15 \
+  --rollout-workers 8 \
+  --eval-workers 4 \
+  --device cuda \
+  --tensorboard-logdir runs/six-player-strong/tensorboard \
+  --seed 0
 ```
 
 ## Evaluate and play a trained model

@@ -59,6 +59,7 @@ class PolicyForwardOutputs:
     logits: Tensor
     values: Tensor
     belief_logits: Tensor
+    expected_trick_logits: Tensor
 
 
 @dataclass(frozen=True)
@@ -210,6 +211,7 @@ class WhistPolicyNetwork(nn.Module):
             nn.Linear(belief_hidden, self.belief_classes),
         )
         self.bid_head = nn.Linear(embed_dim, 9)
+        self.expected_trick_head = nn.Linear(embed_dim, 9)
         self.play_query = nn.Linear(embed_dim, embed_dim)
         self.play_candidate = nn.Linear(embed_dim * 2, embed_dim)
         self.play_score = nn.Linear(embed_dim, 1)
@@ -265,10 +267,16 @@ class WhistPolicyNetwork(nn.Module):
         value_latent = self.value_tower(torch.cat([shared_latent, refined_card_summary, seat_summary, scalar_embedding], dim=-1))
 
         bid_logits = self.bid_head(bid_latent)
+        expected_trick_logits = self.expected_trick_head(bid_latent)
         play_logits = self._score_card_actions(refined_card_tokens, play_latent, seat_tokens)
         logits = torch.cat([bid_logits, play_logits], dim=-1)
         values = self.value_head(value_latent).squeeze(-1)
-        return PolicyForwardOutputs(logits=logits, values=values, belief_logits=belief_logits)
+        return PolicyForwardOutputs(
+            logits=logits,
+            values=values,
+            belief_logits=belief_logits,
+            expected_trick_logits=expected_trick_logits,
+        )
 
     def _card_context(
         self,

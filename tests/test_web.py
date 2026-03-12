@@ -43,7 +43,7 @@ def test_play_session_and_human_action(tmp_path: pathlib.Path) -> None:
             "mode": "play",
             "players": 4,
             "seed": 0,
-            "roles": ["heuristic", "human", "model", "random"],
+            "roles": ["human", "model", "heuristic", "random"],
             "checkpoint_path": str(checkpoint),
             "device": "cpu",
         },
@@ -51,7 +51,7 @@ def test_play_session_and_human_action(tmp_path: pathlib.Path) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["human_turn"] is True
-    assert payload["current_player"] == 1
+    assert payload["current_player"] == 0
     action = payload["legal_actions"][0]["action"]
 
     next_response = client.post(f"/api/sessions/{payload['session_id']}/action", json={"action": action})
