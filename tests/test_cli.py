@@ -59,6 +59,7 @@ def test_write_resume_scripts_creates_latest_and_best_helpers(tmp_path: pathlib.
         gae_lambda=0.95,
         reward_shaping=0.5,
         final_reward_shaping=None,
+        strong_hand_underbid_penalty=1.0,
         latest_weight=0.5,
         snapshot_weight=0.35,
         scripted_weight=0.15,
@@ -79,3 +80,4 @@ def test_write_resume_scripts_creates_latest_and_best_helpers(tmp_path: pathlib.
     assert 'CHECKPOINT="$OUTPUT/best.pt"' in best.read_text()
     assert "imitation" not in latest.read_text()
     assert "imitation" not in best.read_text()
+    assert "--strong-hand-underbid-penalty 1.0" in latest.read_text()

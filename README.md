@@ -38,7 +38,7 @@ uv run romanian-whist train \
   --seed 0
 ```
 
-This trains one shared model across `3-6` players, writes rolling checkpoints under `runs/universal`, and keeps `best.pt` plus per-update evaluation reports aggregated and broken out by player count.
+This trains one shared model across `3-6` players, writes rolling checkpoints under `runs/universal`, and keeps `best.pt` plus per-update evaluation reports aggregated and broken out by player count. It also writes `training_diagnostics.json`, which bundles the run config, per-update history, evaluation snapshots, and a few automatically detected pain points you can share for follow-up analysis.
 
 TensorBoard logs are written to `runs/universal/tensorboard` by default. Start TensorBoard with:
 

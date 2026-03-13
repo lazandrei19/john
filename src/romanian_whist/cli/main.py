@@ -116,6 +116,7 @@ def _train_command(
     gae_lambda: float,
     reward_shaping: float,
     final_reward_shaping: Optional[float],
+    strong_hand_underbid_penalty: float,
     latest_weight: float,
     snapshot_weight: float,
     scripted_weight: float,
@@ -157,6 +158,8 @@ def _train_command(
         str(gae_lambda),
         "--reward-shaping",
         str(reward_shaping),
+        "--strong-hand-underbid-penalty",
+        str(strong_hand_underbid_penalty),
         "--latest-weight",
         str(latest_weight),
         "--snapshot-weight",
@@ -240,6 +243,7 @@ def train(
     gae_lambda: float = typer.Option(0.95, "--gae-lambda"),
     reward_shaping: float = typer.Option(0.5, "--reward-shaping"),
     final_reward_shaping: Optional[float] = typer.Option(None, "--final-reward-shaping"),
+    strong_hand_underbid_penalty: float = typer.Option(1.0, "--strong-hand-underbid-penalty"),
     latest_weight: float = typer.Option(0.5, "--latest-weight"),
     snapshot_weight: float = typer.Option(0.35, "--snapshot-weight"),
     scripted_weight: float = typer.Option(0.15, "--scripted-weight"),
@@ -273,6 +277,7 @@ def train(
             gae_lambda=gae_lambda,
             reward_shaping=reward_shaping,
             final_reward_shaping=final_reward_shaping,
+            strong_hand_underbid_penalty=strong_hand_underbid_penalty,
             latest_weight=latest_weight,
             snapshot_weight=snapshot_weight,
             scripted_weight=scripted_weight,
@@ -305,6 +310,7 @@ def train(
             rollout_player_counts=rollout_player_counts,
             reward_shaping_coef=reward_shaping,
             final_reward_shaping_coef=final_reward_shaping,
+            strong_hand_underbid_penalty=strong_hand_underbid_penalty,
             latest_weight=latest_weight,
             snapshot_weight=snapshot_weight,
             scripted_weight=scripted_weight,
@@ -343,10 +349,13 @@ def train(
             best_policy, _ = _load_checkpoint_or_bad_parameter(best_checkpoint_path, device="cpu")
             best_policy.eval()
             trainer.best_snapshot = best_policy
+        trainer.resume_source = resume_from
         typer.echo(
             "Resuming from {path} at update {update}.".format(path=resume_from, update=start_update)
         )
     history = trainer.train(updates=updates, start_update=start_update)
+    if trainer.training_diagnostics_path is not None:
+        typer.echo("Training diagnostics: {path}".format(path=trainer.training_diagnostics_path))
     typer.echo(json.dumps(history[-1], indent=2))
     typer.echo(json.dumps(trainer.evaluate(matches=evaluation_matches), indent=2))
 

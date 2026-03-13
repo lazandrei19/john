@@ -1,3 +1,4 @@
+import json
 import pathlib
 import platform
 from types import MethodType
@@ -12,7 +13,13 @@ from romanian_whist.agents.model import PolicyAgent, PolicyForwardOutputs, Polic
 from romanian_whist.env.romanian_whist import RomanianWhistEnv
 from romanian_whist.mlx_support.converter import CheckpointConverter
 from romanian_whist.rules.config import WhistVariantConfig
-from romanian_whist.train.league import LeagueConfig, LeagueTrainer
+from romanian_whist.train.league import (
+    LeagueConfig,
+    LeagueTrainer,
+    _apply_focal_bid_feedback,
+    _bid_alignment_reward,
+    _round_potential,
+)
 from romanian_whist.train.ppo import PPOConfig, PPOTrainer, RolloutBuffer
 
 
@@ -48,6 +55,11 @@ def test_ppo_smoke_and_checkpoint_roundtrip(tmp_path: pathlib.Path) -> None:
     assert "policy_bid/mae_vs_actual" in history[-1]
     assert "policy_bid/strong_hand_underbid_rate" in history[-1]
     assert list(tensorboard_dir.glob("events.out.tfevents.*"))
+    diagnostics = json.loads((tmp_path / "training_diagnostics.json").read_text())
+    assert diagnostics["summary"]["latest_metrics"]["timing/update_sec"] == history[-1]["timing/update_sec"]
+    assert diagnostics["summary"]["best_update"] == 1
+    assert diagnostics["history"][-1]["update"] == 1
+    assert isinstance(diagnostics["pain_points"], list)
     assert policy is not None
 
 
@@ -108,6 +120,10 @@ def test_resume_training_continues_checkpoint_numbering(tmp_path: pathlib.Path) 
     assert checkpoint.exists()
     _, resumed_payload = load_policy_checkpoint(checkpoint)
     assert resumed_payload["metadata"]["update"] == 2
+    diagnostics = json.loads((tmp_path / "training_diagnostics.json").read_text())
+    assert [entry["update"] for entry in diagnostics["history"]] == [1, 2]
+    assert diagnostics["run"]["resumed"] is True
+    assert diagnostics["run"]["start_update"] == 1
 
 
 def test_old_checkpoint_format_is_rejected(tmp_path: pathlib.Path) -> None:
@@ -144,6 +160,10 @@ def test_sparse_evaluation_only_writes_reports_on_interval(tmp_path: pathlib.Pat
     assert "selection_score" in history[1]
     assert not (tmp_path / "update-0001.eval.json").exists()
     assert (tmp_path / "update-0002.eval.json").exists()
+    diagnostics = json.loads((tmp_path / "training_diagnostics.json").read_text())
+    assert diagnostics["summary"]["evaluated_updates"] == [2]
+    assert diagnostics["history"][0]["evaluation"] is None
+    assert diagnostics["history"][1]["evaluation"] is not None
 
 
 def test_policy_agent_uses_model_device_for_inference() -> None:
@@ -292,6 +312,58 @@ def test_rollout_bid_metrics_include_hand_size_breakdown() -> None:
     assert "policy_bid/count" in trainer.last_rollout_stats
     assert "policy_bid/by_hand_size/1/mean" in trainer.last_rollout_stats
     assert "policy_bid/by_hand_size/8/rate_1" in trainer.last_rollout_stats
+
+
+def test_apply_focal_bid_feedback_retargets_bid_transition_to_actual_tricks() -> None:
+    rewards = [0.0]
+    observations = [{"expected_trick_target": 3}]
+    events = [
+        {"type": "round_start", "round": 0, "hand_size": 4},
+        {"type": "bid", "player": 1, "bid": 2},
+        {"type": "trick_win", "player": 1, "round": 0},
+        {"type": "trick_win", "player": 1, "round": 0},
+        {"type": "round_score", "round": 0},
+    ]
+
+    _apply_focal_bid_feedback(
+        events,
+        focal_seat=1,
+        bid_transition_indices={0: 0},
+        rewards=rewards,
+        observations=observations,
+        shaping_coef=0.5,
+        strong_hand_underbid_penalty=1.0,
+    )
+
+    assert rewards[0] == pytest.approx(0.5)
+    assert observations[0]["expected_trick_target"] == 2
+
+
+def test_bid_alignment_reward_penalizes_strong_hand_underbids_more_than_overbids() -> None:
+    underbid_reward = _bid_alignment_reward(2, 4, 5, strong_hand_underbid_penalty=1.0)
+    overbid_reward = _bid_alignment_reward(6, 4, 5, strong_hand_underbid_penalty=1.0)
+
+    assert underbid_reward < overbid_reward
+
+
+def test_round_potential_penalizes_winning_risk_after_contract_is_met() -> None:
+    env = RomanianWhistEnv(WhistVariantConfig(players=4, seed=9))
+    env.reset(seed=9)
+    state = env.game.round_state
+    assert state is not None
+    state.phase = "play"
+    state.trump_suit = 0
+    state.bids[0] = 1
+    state.tricks_won[0] = 1
+    state.hand_size = 3
+
+    state.hands[0] = [12, 11]
+    risky_potential = _round_potential(env, 0)
+
+    state.hands[0] = [1, 14]
+    safe_potential = _round_potential(env, 0)
+
+    assert risky_potential < safe_potential
 
 
 def test_balanced_player_count_schedule_covers_all_counts() -> None:

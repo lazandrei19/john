@@ -8,10 +8,12 @@ import multiprocessing as mp
 import time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, is_dataclass
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from queue import Empty
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -59,6 +61,7 @@ class LeagueConfig:
     final_reward_shaping_coef: Optional[float] = None
     bid_reward_shaping_coef: float = 0.25
     final_bid_reward_shaping_coef: Optional[float] = None
+    strong_hand_underbid_penalty: float = 1.0
     rollout_workers: int = 1
     eval_workers: int = 1
     save_best_checkpoint: bool = True
@@ -71,6 +74,20 @@ class LeagueConfig:
             raise ValueError("Opponent mix weights must be non-negative.")
         if sum(weights) <= 0.0:
             raise ValueError("At least one opponent mix weight must be positive.")
+
+
+def _json_ready(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value):
+        return dict((field.name, _json_ready(getattr(value, field.name))) for field in fields(value))
+    if isinstance(value, dict):
+        return dict((str(key), _json_ready(nested)) for key, nested in value.items())
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
 
 
 def _policy_state_cpu(policy: WhistPolicyNetwork) -> Dict[str, object]:
@@ -210,13 +227,20 @@ def _round_potential(env: RomanianWhistEnv, seat: int) -> float:
     if bid is None:
         return 0.0
     tricks = state.tricks_won[seat]
-    hand_remaining = len(state.hands[seat])
+    remaining_cards = state.hands[seat]
+    hand_remaining = len(remaining_cards)
     max_possible = tricks + hand_remaining
     over_bid = max(0, tricks - bid)
     under_bid = max(0, bid - max_possible)
     denominator = float(max(1, state.hand_size))
-    pressure = abs(bid - tricks) / float(max(1, hand_remaining + 1))
-    return -((over_bid + under_bid) / denominator) - (0.1 * pressure)
+    if hand_remaining <= 0:
+        return -((over_bid + under_bid) / denominator)
+    target_remaining = bid - tricks
+    expected_remaining = _estimate_expected_tricks(remaining_cards, state.trump_suit, hand_remaining)
+    clamped_target = min(max(target_remaining, 0), hand_remaining)
+    alignment_penalty = abs(expected_remaining - float(clamped_target)) / float(max(1, hand_remaining))
+    pressure = abs(float(target_remaining)) / float(max(1, hand_remaining + 1))
+    return -((over_bid + under_bid) / denominator) - (0.5 * alignment_penalty) - (0.1 * pressure)
 
 
 def _belief_targets(env: RomanianWhistEnv, observer_seat: int, observation: Dict[str, object]) -> tuple[list[int], list[float]]:
@@ -314,8 +338,56 @@ def _heuristic_bid_target_for_game(env: RomanianWhistEnv, seat: int) -> int:
     return _heuristic_bid_target(state.hands[seat], state.trump_suit, state.hand_size)
 
 
-def _bid_alignment_reward(bid: int, target_bid: int, hand_size: int) -> float:
-    return 1.0 - (abs(float(bid) - float(target_bid)) / float(max(1, hand_size)))
+def _bid_alignment_reward(
+    bid: int,
+    target_bid: int,
+    hand_size: int,
+    *,
+    strong_hand_underbid_penalty: float = 0.0,
+) -> float:
+    denominator = float(max(1, hand_size))
+    miss = abs(float(bid) - float(target_bid)) / denominator
+    penalty_scale = 1.0
+    if target_bid >= 3 and bid < target_bid:
+        penalty_scale += max(0.0, float(strong_hand_underbid_penalty))
+    return max(-1.0, 1.0 - (penalty_scale * miss))
+
+
+def _apply_focal_bid_feedback(
+    events: Sequence[Dict[str, object]],
+    focal_seat: int,
+    bid_transition_indices: Dict[int, int],
+    rewards: List[float],
+    observations: List[Dict[str, object]],
+    shaping_coef: float,
+    strong_hand_underbid_penalty: float,
+) -> None:
+    current_round = -1
+    current_hand_size = 1
+    focal_bid = None  # type: Optional[int]
+    focal_tricks = 0
+    for event in events:
+        event_type = str(event["type"])
+        if event_type == "round_start":
+            current_round = int(event["round"])
+            current_hand_size = int(event["hand_size"])
+            focal_bid = None
+            focal_tricks = 0
+        elif event_type == "bid" and int(event["player"]) == focal_seat:
+            focal_bid = int(event["bid"])
+        elif event_type == "trick_win" and int(event["player"]) == focal_seat:
+            focal_tricks += 1
+        elif event_type == "round_score":
+            transition_index = bid_transition_indices.get(current_round)
+            if transition_index is None or focal_bid is None or transition_index >= len(rewards):
+                continue
+            rewards[transition_index] += shaping_coef * _bid_alignment_reward(
+                focal_bid,
+                focal_tricks,
+                current_hand_size,
+                strong_hand_underbid_penalty=strong_hand_underbid_penalty,
+            )
+            observations[transition_index]["expected_trick_target"] = focal_tricks
 
 
 def _bid_metrics_from_records(records: Sequence[Dict[str, float]], prefix: str) -> Dict[str, float]:
@@ -442,6 +514,7 @@ def _rollout_worker(
                 "last_transition_index": None,
                 "trajectory_id": int(episode["trajectory_id"]),
                 "target_bids_by_round": {},
+                "bid_transition_indices": {},
             }
         )
 
@@ -525,7 +598,6 @@ def _rollout_worker(
                     env = state["env"]
                     is_focal_bid = bool(item["record_transition"]) and action < 9
                     bid_target = int(item.get("bid_target", 0))
-                    hand_size = int(item.get("hand_size", 1))
                     phase = env.game.round_state.phase if env.game.round_state is not None else ""
                     if is_focal_bid:
                         round_index = int(item["round_index"])
@@ -534,13 +606,7 @@ def _rollout_worker(
                     outcome = env.step_outcome(action)
                     after_potential = 0.0 if outcome.match_finished or phase != "play" else _round_potential(env, state["focal_seat"])
                     shaped_reward = outcome.rewards[state["focal_seat"]]
-                    if is_focal_bid:
-                        shaped_reward += float(task.get("bid_reward_shaping_coef", 0.0)) * _bid_alignment_reward(
-                            action,
-                            bid_target,
-                            hand_size,
-                        )
-                    elif phase == "play":
+                    if phase == "play":
                         shaped_reward += float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
                     if item["record_transition"]:
                         if state["last_transition_index"] is not None:
@@ -554,6 +620,8 @@ def _rollout_worker(
                         dones.append(outcome.match_finished)
                         trajectory_ids.append(state["trajectory_id"])
                         state["last_transition_index"] = len(actions) - 1
+                        if is_focal_bid:
+                            state["bid_transition_indices"][int(item["round_index"])] = state["last_transition_index"]
                     elif state["last_transition_index"] is not None:
                         rewards[state["last_transition_index"]] += shaped_reward
                         dones[state["last_transition_index"]] = outcome.match_finished
@@ -571,7 +639,6 @@ def _rollout_worker(
                     env = state["env"]
                     is_focal_bid = bool(item["record_transition"]) and action < 9
                     bid_target = int(item.get("bid_target", 0))
-                    hand_size = int(item.get("hand_size", 1))
                     phase = env.game.round_state.phase if env.game.round_state is not None else ""
                     if is_focal_bid:
                         round_index = int(item["round_index"])
@@ -580,13 +647,7 @@ def _rollout_worker(
                     outcome = env.step_outcome(action)
                     after_potential = 0.0 if outcome.match_finished or phase != "play" else _round_potential(env, state["focal_seat"])
                     shaped_reward = outcome.rewards[state["focal_seat"]]
-                    if is_focal_bid:
-                        shaped_reward += float(task.get("bid_reward_shaping_coef", 0.0)) * _bid_alignment_reward(
-                            action,
-                            bid_target,
-                            hand_size,
-                        )
-                    elif phase == "play":
+                    if phase == "play":
                         shaped_reward += float(task.get("reward_shaping_coef", 0.0)) * (after_potential - before_potential)
                     if item["record_transition"]:
                         if state["last_transition_index"] is not None:
@@ -600,6 +661,8 @@ def _rollout_worker(
                         dones.append(outcome.match_finished)
                         trajectory_ids.append(state["trajectory_id"])
                         state["last_transition_index"] = len(actions) - 1
+                        if is_focal_bid:
+                            state["bid_transition_indices"][int(item["round_index"])] = state["last_transition_index"]
                     elif state["last_transition_index"] is not None:
                         rewards[state["last_transition_index"]] += shaped_reward
                         dones[state["last_transition_index"]] = outcome.match_finished
@@ -610,6 +673,15 @@ def _rollout_worker(
 
     for state in episode_states:
         replay = state["env"].serialize_replay()
+        _apply_focal_bid_feedback(
+            replay["events"],
+            int(state["focal_seat"]),
+            state["bid_transition_indices"],
+            rewards,
+            observations,
+            float(task.get("bid_reward_shaping_coef", 0.0)),
+            float(task.get("strong_hand_underbid_penalty", 0.0)),
+        )
         seat_labels = [str(index) for index in range(state["env"].config.players)]
         episode_bid_records = bid_records_from_events(
             replay["events"],
@@ -985,6 +1057,7 @@ class LeagueTrainer:
         self.gpu_inference_snapshot_keys = ()  # type: tuple[int, ...]
         self.last_rollout_stats = {}  # type: Dict[str, float]
         self.last_eval_stats = {}  # type: Dict[str, float]
+        self.resume_source = None  # type: Optional[Path]
         self.writer = (
             SummaryWriter(log_dir=str(self.league_config.tensorboard_log_dir))
             if self.league_config.tensorboard_log_dir is not None
@@ -1005,6 +1078,7 @@ class LeagueTrainer:
     def train(self, updates: Optional[int] = None, start_update: int = 0) -> List[Dict[str, float]]:
         total_updates = updates or self.league_config.total_updates
         history = []
+        diagnostics_history = self._load_existing_diagnostics_history(start_update)
         try:
             for local_update_index in range(total_updates):
                 update_index = start_update + local_update_index + 1
@@ -1066,6 +1140,8 @@ class LeagueTrainer:
                 checkpoint_time = time.perf_counter() - checkpoint_start
                 metrics["timing/checkpoint_sec"] = checkpoint_time
                 metrics["timing/update_sec"] = time.perf_counter() - update_start
+                diagnostics_history.append(self._build_diagnostics_history_entry(update_index, metrics, evaluation))
+                self._write_training_diagnostics(diagnostics_history, requested_updates=total_updates, start_update=start_update)
                 self._log_update(update_index, metrics, evaluation)
         finally:
             if self.rollout_pool is not None:
@@ -1138,6 +1214,7 @@ class LeagueTrainer:
                 "snapshot_policy_states": [],
                 "reward_shaping_coef": self.current_reward_shaping_coef,
                 "bid_reward_shaping_coef": self.current_bid_reward_shaping_coef,
+                "strong_hand_underbid_penalty": self.league_config.strong_hand_underbid_penalty,
             }
             for chunk in _chunk_items(task_episodes, worker_count)
         ]
@@ -1191,6 +1268,7 @@ class LeagueTrainer:
             opponent_agents = self._sample_opponents(players, focal_seat, active_snapshot_indices)
             last_transition_index = None
             target_bids_by_round = {}  # type: Dict[int, Dict[int, int]]
+            bid_transition_indices = {}  # type: Dict[int, int]
             while not all(env.terminations.values()):
                 acting_agent = env.agent_selection
                 seat = env.agent_index(acting_agent)
@@ -1203,7 +1281,6 @@ class LeagueTrainer:
                     if last_transition_index is not None:
                         buffer.next_values[last_transition_index] = value
                     state = env.game.round_state
-                    hand_size = 1 if state is None else state.hand_size
                     round_index = -1 if state is None else state.round_index
                     target_bid = int(training_observation["expected_trick_target"])
                     phase = "" if state is None else state.phase
@@ -1213,9 +1290,7 @@ class LeagueTrainer:
                     outcome = env.step_outcome(action)
                     after_potential = 0.0 if outcome.match_finished or phase != "play" else _round_potential(env, focal_seat)
                     reward = outcome.rewards[focal_seat]
-                    if action < 9:
-                        reward += self.current_bid_reward_shaping_coef * _bid_alignment_reward(action, target_bid, hand_size)
-                    elif phase == "play":
+                    if phase == "play":
                         reward += self.current_reward_shaping_coef * (after_potential - before_potential)
                     done = outcome.match_finished
                     last_transition_index = buffer.add(
@@ -1227,6 +1302,8 @@ class LeagueTrainer:
                         done=done,
                         trajectory_id=episode_index,
                     )
+                    if action < 9:
+                        bid_transition_indices[round_index] = last_transition_index
                 else:
                     phase = env.game.round_state.phase if env.game.round_state is not None else ""
                     before_potential = _round_potential(env, focal_seat) if phase == "play" else 0.0
@@ -1240,6 +1317,15 @@ class LeagueTrainer:
                         buffer.rewards[last_transition_index] += shaped_reward
                         buffer.dones[last_transition_index] = outcome.match_finished
             replay = env.serialize_replay()
+            _apply_focal_bid_feedback(
+                replay["events"],
+                focal_seat,
+                bid_transition_indices,
+                buffer.rewards,
+                buffer.observations,  # type: ignore[arg-type]
+                self.current_bid_reward_shaping_coef,
+                self.league_config.strong_hand_underbid_penalty,
+            )
             seat_labels = [str(index) for index in range(players)]
             episode_bid_records = bid_records_from_events(replay["events"], seat_labels, target_bids_by_round)
             bid_records.extend(
@@ -1323,9 +1409,10 @@ class LeagueTrainer:
                     "snapshot_policy_states": snapshot_policy_states,
                     "reward_shaping_coef": self.current_reward_shaping_coef,
                     "bid_reward_shaping_coef": self.current_bid_reward_shaping_coef,
+                    "strong_hand_underbid_penalty": self.league_config.strong_hand_underbid_penalty,
                 }
                 for chunk in _chunk_items(task_episodes, worker_count)
-        ]
+            ]
         if self.rollout_pool is not None and self.rollout_pool.workers != worker_count:
             self.rollout_pool.close()
             self.rollout_pool = None
@@ -1628,3 +1715,326 @@ class LeagueTrainer:
         elif isinstance(value, (int, float)):
             scalars.append((prefix, float(value)))
         return scalars
+
+    @property
+    def training_diagnostics_path(self) -> Optional[Path]:
+        if self.league_config.checkpoint_dir is None:
+            return None
+        return self.league_config.checkpoint_dir / "training_diagnostics.json"
+
+    def _load_existing_diagnostics_history(self, start_update: int) -> List[Dict[str, object]]:
+        path = self.training_diagnostics_path
+        if path is None or start_update <= 0 or not path.exists():
+            return []
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return []
+        history = payload.get("history", [])
+        if not isinstance(history, list):
+            return []
+        filtered = []
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            update = int(entry.get("update", 0))
+            if update <= start_update:
+                filtered.append(entry)
+        return filtered
+
+    def _build_diagnostics_history_entry(
+        self,
+        update_index: int,
+        metrics: Dict[str, float],
+        evaluation: Optional[Dict[str, object]],
+    ) -> Dict[str, object]:
+        return {
+            "update": update_index,
+            "metrics": _json_ready(dict(metrics)),
+            "evaluation": _json_ready(evaluation),
+        }
+
+    def _write_training_diagnostics(
+        self,
+        history: Sequence[Dict[str, object]],
+        *,
+        requested_updates: int,
+        start_update: int,
+    ) -> None:
+        path = self.training_diagnostics_path
+        checkpoint_dir = self.league_config.checkpoint_dir
+        if path is None or checkpoint_dir is None:
+            return
+        latest_entry = history[-1] if history else None
+        latest_update = int(latest_entry["update"]) if latest_entry is not None else start_update
+        eval_entries = [entry for entry in history if entry.get("evaluation") is not None]
+        best_entry = None
+        if eval_entries:
+            best_entry = max(
+                eval_entries,
+                key=lambda entry: float(dict(entry.get("metrics", {})).get("selection_score", float("-inf"))),
+            )
+        payload = {
+            "schema_version": 1,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "share_with_assistant": (
+                "Share this JSON file in a follow-up and I can inspect the full training history, "
+                "evaluation snapshots, and the highlighted pain points."
+            ),
+            "run": {
+                "requested_updates": requested_updates,
+                "resumed": start_update > 0,
+                "start_update": start_update,
+                "latest_update": latest_update,
+                "completed_updates_this_invocation": max(0, latest_update - start_update),
+                "resume_source": str(self.resume_source) if self.resume_source is not None else None,
+            },
+            "config": {
+                "variant": _json_ready(self.variant_config),
+                "policy": _json_ready(self.policy_config),
+                "ppo": _json_ready(self.ppo_config),
+                "league": _json_ready(self.league_config),
+            },
+            "artifacts": {
+                "output_dir": str(checkpoint_dir),
+                "diagnostics": str(path),
+                "tensorboard_log_dir": (
+                    str(self.league_config.tensorboard_log_dir)
+                    if self.league_config.tensorboard_log_dir is not None
+                    else None
+                ),
+                "latest_checkpoint": str(checkpoint_dir / "update-{index:04d}.pt".format(index=latest_update)),
+                "best_checkpoint": str(checkpoint_dir / "best.pt"),
+                "best_evaluation_report": str(checkpoint_dir / "best.eval.json"),
+                "latest_evaluation_report": (
+                    str(
+                        checkpoint_dir
+                        / "update-{index:04d}.eval.json".format(index=int(eval_entries[-1]["update"]))
+                    )
+                    if eval_entries
+                    else None
+                ),
+            },
+            "metric_guide": self._diagnostics_metric_guide(),
+            "summary": self._build_diagnostics_summary(history, best_entry),
+            "pain_points": self._detect_pain_points(history),
+            "history": _json_ready(list(history)),
+        }
+        path.write_text(json.dumps(payload, indent=2))
+
+    def _build_diagnostics_summary(
+        self,
+        history: Sequence[Dict[str, object]],
+        best_entry: Optional[Dict[str, object]],
+    ) -> Dict[str, object]:
+        if not history:
+            return {
+                "latest_metrics": None,
+                "latest_evaluation": None,
+                "best_update": None,
+                "best_selection_score": None,
+            }
+        latest_entry = history[-1]
+        latest_metrics = dict(latest_entry.get("metrics", {}))
+        latest_evaluation = latest_entry.get("evaluation")
+        if latest_evaluation is None:
+            for entry in reversed(history[:-1]):
+                if entry.get("evaluation") is not None:
+                    latest_evaluation = entry.get("evaluation")
+                    break
+        best_metrics = dict(best_entry.get("metrics", {})) if best_entry is not None else {}
+        return {
+            "latest_stage": latest_metrics.get("stage"),
+            "latest_metrics": latest_metrics,
+            "latest_evaluation": latest_evaluation,
+            "latest_selection_score": latest_metrics.get("selection_score"),
+            "best_update": best_entry.get("update") if best_entry is not None else None,
+            "best_selection_score": best_metrics.get("selection_score"),
+            "evaluated_updates": [int(entry["update"]) for entry in history if entry.get("evaluation") is not None],
+        }
+
+    def _diagnostics_metric_guide(self) -> Dict[str, str]:
+        return {
+            "selection_score": "Composite evaluation score used for best-checkpoint selection. Higher is better.",
+            "entropy": "Policy action entropy. Lower values mean less exploration; collapsing too quickly can signal premature certainty.",
+            "value_loss": "Critic prediction error. Persistent growth can mean unstable value targets or poor return modeling.",
+            "policy_bid/mae_vs_actual": "Average gap between the model's bid and the tricks it actually wins. Lower is better.",
+            "contract_hit_rate": "How often bids are matched closely enough to convert into good outcomes. Higher is better.",
+            "strong_hand_underbid_rate": "How often the policy bids too low on strong hands. Lower is better.",
+        }
+
+    def _detect_pain_points(self, history: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+        if not history:
+            return []
+
+        findings = []
+        latest_entry = history[-1]
+        latest_metrics = dict(latest_entry.get("metrics", {}))
+        first_metrics = dict(history[0].get("metrics", {}))
+        eval_entries = [entry for entry in history if entry.get("evaluation") is not None]
+        latest_eval = eval_entries[-1].get("evaluation") if eval_entries else None
+
+        def metric(metrics: Dict[str, object], key: str, default: float = 0.0) -> float:
+            raw = metrics.get(key, default)
+            if isinstance(raw, (int, float)):
+                return float(raw)
+            return default
+
+        def add(
+            severity: str,
+            title: str,
+            summary: str,
+            suggestion: str,
+            evidence: Dict[str, object],
+        ) -> None:
+            findings.append(
+                {
+                    "severity": severity,
+                    "title": title,
+                    "summary": summary,
+                    "suggestion": suggestion,
+                    "evidence": _json_ready(evidence),
+                }
+            )
+
+        if latest_eval is None:
+            add(
+                "low",
+                "No fresh evaluation snapshot",
+                "This run has not produced an evaluation report yet, so the losses alone do not say whether gameplay is improving.",
+                "Keep evaluations reasonably frequent for short runs, or run the eval command after training before judging the checkpoint.",
+                {"evaluation_interval": self.league_config.evaluation_interval},
+            )
+        else:
+            overall = dict(latest_eval.get("overall", {}))
+            average_scores = dict(overall.get("average_scores", {}))
+            contract_hit_rate = dict(overall.get("contract_hit_rate", {}))
+            trick_differential = dict(overall.get("trick_differential", {}))
+            underbid_rate = dict(overall.get("strong_hand_underbid_rate", {}))
+
+            policy_average_score = float(average_scores.get("policy", 0.0))
+            heuristic_average_score = float(average_scores.get("heuristic", 0.0))
+            safe_average_score = float(average_scores.get("safe", 0.0))
+            if policy_average_score + 0.25 < max(heuristic_average_score, safe_average_score):
+                add(
+                    "high",
+                    "Policy trails scripted baselines",
+                    "The latest evaluation still scores below the stronger scripted bots, which suggests the policy has not yet learned to beat your hand-built opponents reliably.",
+                    "Keep training longer and focus on the metrics tied to the biggest evaluation gap, especially bidding quality and contract conversion.",
+                    {
+                        "policy_average_score": policy_average_score,
+                        "heuristic_average_score": heuristic_average_score,
+                        "safe_average_score": safe_average_score,
+                    },
+                )
+
+            policy_contract_hit = float(contract_hit_rate.get("policy", 0.0))
+            heuristic_contract_hit = float(contract_hit_rate.get("heuristic", 0.0))
+            safe_contract_hit = float(contract_hit_rate.get("safe", 0.0))
+            if policy_contract_hit + 0.03 < max(heuristic_contract_hit, safe_contract_hit):
+                add(
+                    "medium",
+                    "Contract conversion is lagging",
+                    "The model is still turning bids into successful rounds less often than the best scripted baseline.",
+                    "Treat this as a bidding-and-follow-through issue. Bid calibration and reward shaping are the first knobs worth revisiting.",
+                    {
+                        "policy_contract_hit_rate": policy_contract_hit,
+                        "heuristic_contract_hit_rate": heuristic_contract_hit,
+                        "safe_contract_hit_rate": safe_contract_hit,
+                    },
+                )
+
+            policy_underbid_rate = float(underbid_rate.get("policy", 0.0))
+            if policy_underbid_rate >= 0.20:
+                add(
+                    "medium",
+                    "Strong hands are being underbid",
+                    "The policy is still too conservative on strong hands, which usually leaves score on the table before play even starts.",
+                    "Watch the expected-trick and bid metrics together. If this remains high, the bidding target signal may need more weight or more training.",
+                    {"policy_strong_hand_underbid_rate": policy_underbid_rate},
+                )
+
+            policy_trick_differential = float(trick_differential.get("policy", 0.0))
+            if policy_trick_differential <= -0.25:
+                add(
+                    "medium",
+                    "Play phase is losing trick differential",
+                    "Even when the policy gets to play out hands, it is still losing tricks on average against the evaluation field.",
+                    "That usually means rollout quality or play-phase learning is behind the bidding head. Reward shaping decay and more updates can help separate those effects.",
+                    {"policy_trick_differential": policy_trick_differential},
+                )
+
+        bid_mae = metric(latest_metrics, "policy_bid/mae_vs_actual")
+        if bid_mae >= 1.0:
+            add(
+                "medium",
+                "Bid calibration is still rough",
+                "The policy's bids are off by about a trick or more on average, which is large for this game.",
+                "Prioritize this if your gameplay looks inconsistent. It often shows up before average score catches up.",
+                {"policy_bid_mae_vs_actual": bid_mae},
+            )
+
+        latest_value_loss = metric(latest_metrics, "value_loss")
+        first_value_loss = metric(first_metrics, "value_loss", latest_value_loss)
+        if len(history) >= 3 and latest_value_loss > max(1.0, first_value_loss * 1.5):
+            add(
+                "medium",
+                "Critic loss is elevated",
+                "Value loss has grown noticeably over the run, which can make PPO updates noisy or hard to trust.",
+                "If this persists across runs, consider smaller learning-rate steps, more rollout data per update, or less aggressive shaping.",
+                {
+                    "first_value_loss": first_value_loss,
+                    "latest_value_loss": latest_value_loss,
+                },
+            )
+
+        latest_entropy = metric(latest_metrics, "entropy")
+        first_entropy = metric(first_metrics, "entropy", latest_entropy)
+        if len(history) >= 5 and latest_entropy <= 0.35 and latest_entropy < (0.5 * first_entropy):
+            add(
+                "low",
+                "Exploration collapsed quickly",
+                "Entropy dropped sharply during the run, so the policy may have become too confident before it learned robust play.",
+                "Check this alongside evaluation quality. If the model is not improving, try a slower entropy decay or more diverse rollouts.",
+                {
+                    "first_entropy": first_entropy,
+                    "latest_entropy": latest_entropy,
+                    "entropy_coef": metric(latest_metrics, "entropy_coef", self.ppo.entropy_coef),
+                },
+            )
+
+        if len(eval_entries) >= 2:
+            selection_scores = [metric(dict(entry.get("metrics", {})), "selection_score") for entry in eval_entries]
+            latest_selection_score = selection_scores[-1]
+            previous_best = max(selection_scores[:-1])
+            if latest_selection_score + 0.5 < previous_best:
+                add(
+                    "medium",
+                    "Recent evaluation regressed",
+                    "The latest evaluated checkpoint is meaningfully worse than an earlier checkpoint from this run.",
+                    "Favor the saved best checkpoint over the newest one, and compare the last few updates before changing hyperparameters.",
+                    {
+                        "latest_selection_score": latest_selection_score,
+                        "best_prior_selection_score": previous_best,
+                    },
+                )
+
+        eval_sec = metric(latest_metrics, "timing/eval_sec")
+        rollout_sec = metric(latest_metrics, "timing/rollout_sec")
+        ppo_sec = metric(latest_metrics, "timing/ppo_sec")
+        if eval_sec > 0.0 and eval_sec > (rollout_sec + ppo_sec):
+            add(
+                "low",
+                "Evaluation dominates wall-clock time",
+                "A large share of training time is going into evaluation rather than collecting data or updating the policy.",
+                "If throughput matters more than constant monitoring, evaluate less often or with fewer matches during exploratory runs.",
+                {
+                    "timing_eval_sec": eval_sec,
+                    "timing_rollout_sec": rollout_sec,
+                    "timing_ppo_sec": ppo_sec,
+                },
+            )
+
+        severity_rank = {"high": 0, "medium": 1, "low": 2}
+        findings.sort(key=lambda finding: (severity_rank.get(str(finding.get("severity")), 3), str(finding.get("title"))))
+        return findings[:6]
